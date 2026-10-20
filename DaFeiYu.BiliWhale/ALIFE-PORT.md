@@ -1,0 +1,209 @@
+# Alife 移植版说明 · `DaFeiYu.BiliWhale`
+
+把 [`Alterssss/dsh-bili-whale`](https://github.com/Alterssss/dsh-bili-whale)（MIT）移植成 **Alife 框架的插件模块**：
+让她（大肥鱼）像过日子一样刷 B 站 —— 自己按作息醒来、选题、看懂视频、写两本日记、把值得的分享给主人；并监听评论区与待审回复。
+
+> 上游原版是 **DeepSeek Harness（DSH）** 的插件；本移植**不重写任何 B 站接口**，而是把上游的 Node 工具链整体搬过来当外部进程调用（薄封装）。
+> 上游代码以 MIT 许可分发，许可原文见 `upstream-LICENSE`，上游 README/CHANGELOG/NOTICE 一并保留。
+
+---
+
+## 1. 目录结构
+
+```
+DaFeiYu.BiliWhale/
+├─ manifest.json              插件清单（依赖 Alife.Function.FunctionCaller）
+├─ BiliWhaleModule.cs         模块本体：35 个 XmlFunction（她调用的工具面）
+├─ BiliWhaleClock.cs          生物钟 + 评论区守夜 + 私信守夜（partial）
+├─ BiliWhaleRunner.cs         运行环境：定位 node/ffmpeg、写配置与凭据、起子进程
+├─ BiliWhaleConfig.cs         插件配置（一部分翻译成上游的统一配置）
+├─ tools/                     ★ 上游 Node 工具链（41 个 .mjs，原样搬运）
+├─ upstream-*.{md,json}       上游 README / CHANGELOG / NOTICE / LICENSE / package.json
+└─ ALIFE-PORT.md              本文件
+```
+
+运行时数据（**不在这里**，见 §3）：
+
+```
+Storage/PluginData/DaFeiYu.BiliWhale/
+├─ bili-whale.config.json     由插件配置翻译生成（喂给工具链）
+├─ biliwhale.log              插件自己的日志（含"生物钟自检"，排错先看它）
+└─ home/                      ← 被伪装成"家目录"给子进程用
+   ├─ .bili-ai/credentials.json   B站凭据（SESSDATA / bili_jct / buvid3）
+   ├─ .bili-ai/quota.json         发言额度与白名单
+   ├─ .bili-ai/replied.json       "同一个人 30 天只回一条"的记账
+   ├─ .bili-ai/feedback.json      主人的表态（沉默档位靠它）
+   ├─ .dsh/whale-night.json       今天的作息计划（窗口/时刻/醒了几次）
+   ├─ .dsh/whale-diary.md         ★ 两本日记之一：给主人的信
+   ├─ .dsh/whale-diary-private.md ★ 两本日记之二：给自己的（不加滤镜）
+   ├─ .dsh/whale-log.jsonl        结构化事件流
+   ├─ .dsh/whale-notify.log       报备记录
+   └─ .dsh/shots/                 抽帧出的九宫格图
+```
+
+## 2. 关键设计：**不改上游一行逻辑**，靠环境变量"搬家"
+
+上游每个脚本都从 `process.env.USERPROFILE || process.env.HOME` 推导状态路径，配置路径则可用 `BILI_WHALE_CONFIG` 覆盖。
+于是插件给每个子进程换一套环境变量，就把上游的全部状态关进了插件数据目录：
+
+| 环境变量 | 插件给的值 | 作用 |
+|---|---|---|
+| `USERPROFILE` / `HOME` | `<PluginData>/home` | 凭据、额度、日记、事件、截图全部落在这里 |
+| `BILI_WHALE_CONFIG` | `<PluginData>/bili-whale.config.json` | 统一配置（作息/分享/倾听/口味） |
+| `DSH_HOME` | `<PluginData>/home/.dsh` | 兜底（部分脚本认它） |
+| `FFMPEG` | 探测到的 ffmpeg 全路径 | 抽帧看画面（不装也能跑，只是少一条腿） |
+
+**好处**：上游升级时把 `tools/` 整个换掉即可，不会和本移植的改动打架。
+
+### 对上游做的唯一改动（2 行，纯显示文本）
+
+上游输出里有两处写着 DSH 专属的工具名，会误导她（她没有 `notify_wechat` 这个工具，也不该绕过插件去直接跑 `node bili.mjs`）：
+
+| 文件 | 改动 |
+|---|---|
+| `tools/commands/diary.mjs:108` | 输出提示里的 `notify_wechat`（+ 指向上游 AGENTS.md 的说明）→ `<BiliNotify message="…"/>` |
+| `tools/commands/feed.mjs:210` | 输出提示里的 `node bili.mjs debrief <BV>` → `<BiliDebrief bvid="<BV>"/>` |
+
+不改这两处的风险是实的：她可能去调一个不存在的工具，或用 `ProcessService` 直接跑 `node bili.mjs`（那会绕过环境隔离、把状态写进 Alife 进程自己的家目录）。
+
+### 上游自身的缺陷（3 条命令不可用，**非本移植引入**）
+
+`tools/bili.mjs` 的命令映射表共 38 条，其中 3 条指向**上游仓库里并不存在**的文件：
+
+| 命令 | 映射到 | 影响 |
+|---|---|---|
+| `auto` | `commands/danmaku-auto.mjs` | 直播间自动回复 —— 不在本次范围 |
+| `dyn-keywords` | `diagnostics/dyn-detail-keywords.mjs` | 动态排查工具 —— 不在范围 |
+| `dyn-page` | `diagnostics/dyn-page-keywords.mjs` | 动态排查工具 —— 不在范围 |
+
+其余 35 条命令的文件都在。
+
+### 上游配置读取不一致（**本移植已从插件侧绕开**）
+
+`tools/lib/config.mjs` 认 `$BILI_WHALE_CONFIG`（本移植正是靠它把配置搬进 `PluginData`），
+但有两个脚本是**自己拼路径**去读 `<HOME>/.dsh/bili-whale.config.json` 的，根本不走那个模块：
+
+| 文件 | 症状 |
+|---|---|
+| `tools/commands/fav.mjs:20` | 收藏直接 `ENOENT` 崩（实测：2026-10-20 22:00 她第一次收藏就撞上） |
+| `tools/commands/selftest.mjs:16` | 配置文件那行永远显示"没有"，自检表第一行红 |
+
+**修法：不改上游源码** —— `BiliWhaleRunner.WriteToolConfig()` 把同一份 JSON **双写**：既写 `$BILI_WHALE_CONFIG` 指向的正式文件，也往 `<HOME>/.dsh/` 补一份同内容副本。
+两个脚本照旧能找到配置，而 `tools/` 依然可以整包替换。（`notify.mjs` 只是注释里提到这个路径，不读，无需处理。）
+
+## 3. 与 Alife 的对接
+
+- **工具面**：35 个 `[XmlFunction]`，读命令（`BiliFeed`/`BiliDebrief`/`BiliSearch`/`BiliCommentDigest`/`BiliLikes`/`BiliDiaryShow`…）+ 写命令（`BiliComment`/`BiliDm`/`BiliDynamicPost`/`BiliFav`/`BiliDraftAdd`…）+ 兜底 `BiliRun`。
+  所有写操作**必须显式 `dry`**：`dry="true"` 只打印请求，`dry="false"` 才真发。
+- **生物钟**：起一个廉价的 `node bili.mjs night clock` 子进程 —— 它在作息窗口内随机挑一刻，睡到点就**退出**（打印 `WHALE_WAKE`）；"今天不想看"则睡到窗口末退出（`WHALE_SKIP`）；次数用完 `WHALE_DONE`。
+  插件监听它退出 → `interactor.Poke()` 把"你醒了"的指令推给她。用"进程退出"当闹钟：随机时刻 / 跨午夜 / 次数上限全在上游算，只有一处真相。
+- **守夜（零 token）**：`node bili.mjs comment-await --quiet` 常驻守「回复我的」收件箱，**有人找她才退出**并叫醒她；没人理就一直静默（不烧 token）。私信同理（`dm-await`，默认关）。
+
+### 分享闸门：**第一次分享必须先报备**（主人的规矩，代码强制）
+
+上游那句 `dry="true"` → "确认后 `dry="false"`" 在自主流程里会被她理解成"自己确认"，于是她第一次就直接发了（2026-10-20 21:58 实测踩到）。
+所以加了一道**自闭合**的闸门：
+
+- **未放行时**：唤醒提示词里注入硬规则 —— 第一条分享只能 `dry="true"` 出原文 → `<BiliNotify>` 把原文推给主人 → **收工等回话**；主人说"可以"之后，那一条要用 **`auto="false"`**（= 主人当场授权）发。
+- **放行判定**：插件看到 `share && !auto && !dry` 且输出含 `评论已发出` → 写 `<StateRoot>/share-gate.json`（`opened:true`）→ **永久放开**，之后她回自主节奏。
+- **为什么不用 `quota.json` 判断**：`tools/commands/quota.mjs:165` 是 `auto: !!opt.auto || !!opt.share` —— **任何分享都被记成 `auto:true`**，账本里分不出"自主发的"和"主人授权的"。所以状态必须由插件自己记。
+- 只拦「分享型」；回别人评论 / 收藏 / 写日记不受影响。`BiliWhaleStatus` 里能看到闸门开没开。
+
+2026-10-20 22:00 那条已发的分享（`rpid=317664224161`）主人选择**保留**，闸门保持未放行 —— 她下一轮会先报备。
+
+### 配置热更新：设置页改开关 → **立刻生效（不用重载插件）**
+
+**框架事实（读 v4.6.1 源码确认）**：`Alife.Framework.ConfigurationSystem.SetConfiguration()` **只把配置写进文件，不通知活着的模块实例** ——
+`ChatActivity` 只在实例创建那一刻赋一次 `Configuration`（`ChatActivity.cs:81-85`）。
+所以按常规写法，改任何开关都必须 `reload_plugin` + 重启角色（35–55 秒），这既慢又容易踩激活竞态。
+
+**本插件的做法**：框架的 `ChatActivity.StartTimer(0.3f, …)` 每 0.3 秒遍历所有 `ChatBehaviour` 调一次 `UpdateAsync` →
+`ChatBehaviour.OnUpdate()`（`ChatBehaviour.cs:52-82`）。我们**拿它当心跳**：
+
+```
+OnUpdate()  →  每 10 个 tick（≈3 秒）比对模块配置文件时间戳
+            →  变了就：反序列化新配置 → 重建 runner + Prepare()（重写凭据与工具链配置）
+            →  StartAutomation()（内部先 Stop，按新开关起停子进程）
+            →  日志一行：⚙ 配置热更新已生效（没有重载插件）：生物钟=开 评论区守夜=开 … → …
+```
+
+配置路径按 `ConfigurationSystem.GetConfigurationFilePath` 的同一顺序找：**角色级优先**
+（`{StorageFolderPath}\{Character.StorageKey}\Configuration\{模块全名}.json`），回退全局
+（`{StorageFolderPath}\Configuration\{模块全名}.json`）。
+
+**实测（2026-10-20 22:48 / 22:49，双向）**：22:48:38 把 `ListenComment` 改 `false` → **22:48:40** 日志出现热更新行且 `自动化已启动：…评论区守夜=False`；
+22:49:09 改回 `true` → 22:49:10 生效。全程未重载插件、未重启角色。
+
+**顺带好处**：凭据也走同一条路 —— 在设置页改 `SESSDATA`/`bili_jct` 保存后，`Prepare()` 会重写凭据文件，不必再单独调 `BiliSetCookie`。
+**注意**：热更新只在角色**已激活**时生效（`OnUpdate` 得有 tick）；角色没激活时改配置，下次激活自然就是新值。
+- **注入**：`OnAwake` 里 `interactor.Prompt()` 注入一段用法（含两本日记的路径）；每次叫醒用 `interactor.Poke()` 推一份分步指令（醒来版 / 不看版 / 有人找你版）。
+- **报备**：`BiliNotify` 记进 `whale-notify.log`，并按配置提示她用 `<QChat type="Private" targetid="…">` 私聊发给主人。
+
+## 4. 配置对照（插件配置 → 上游配置）
+
+| 插件配置 | 上游字段 | 说明 |
+|---|---|---|
+| `NightWindows`（如 `20:00-24:00=1`） | `night.windows[]` | 窗口 = 一次醒来的机会；`=1` 是次数 |
+| `SkipChance` | `night.skipChance` | 每次醒来独立掷骰子，"不想看"是合法结果 |
+| `MaxVideos` | `night.maxVideos` | 一次初筛几条 |
+| `LikeTags` / `DislikeTags` | `preferences.like/dislike` | 选题加权 |
+| `ShareEnabled` / `ShareVia` / `MinScore` / `ShareDaily` | `share.*` / `quota.shareDaily` | 分享开关 / 评论还是私信 / 评分阈值 / 每日上限 |
+| `SilentAfterDays` / `SilentStopDays` | `share.silentAfterDays/silentStopDays` | 主人几天没表态 → 收敛 / 停发 |
+| `ListenComment` / `CommentIntervalSec` / `ListenScope` / `ListenInWindow` / `OncePerPerson` | `listen.*` | 评论监听 |
+| `Sessdata` / `BiliJct` / `Buvid3` | —（写进 `credentials.json`） | B站凭据，**不回显** |
+| `OwnerMid` / `OwnerName` | `owner.mid/name` | 分享要 @ 的人 |
+| `NodeExe` / `FfmpegPath` / `StateRoot` / `CommandTimeoutSec` / `MaxOutputChars` | —（插件自身） | 留空自动探测 |
+
+`NotifyType=file` 是写死的：报备投递交给 Alife 侧的 QChat（不启用上游的 `notify` 后端）。
+
+## 5. 已做的验证
+
+### 5.1 装机与链路（2026-10-20 下午）
+
+| 项 | 结果 |
+|---|---|
+| 依赖体检 `deps` | ✓ ffmpeg 9.0.2（winget 装）/ node v24.21.0 / 数据目录可写 |
+| 环境隔离 | ✓ 凭据与日记全部落在 `PluginData`，没碰真家目录 |
+| 工具链调用链 | ✓ 她调 `<BiliDeps/>` → C# 起 node → 结果回到她上下文 → 她按指令报备 |
+| 生物钟叫醒 | ✓ 演练窗口 13:29–13:33 内 13:29 准点叫醒，随后正确进入 `done` 退避 |
+| 启动自检 | ✓ 日志里"生物钟自检"会打出工具链**实际读到**的作息（防止配置静默失效） |
+
+### 5.2 真实端到端一轮（2026-10-20 21:58，用小号账号实测）
+
+窗口 `21:58–22:03` / 不看概率 0 / 一次 3 条 → **`21:58:39` 她自己醒**（日志 `生物钟叫醒（第 1 次 · 计划 21:58）`），随后：
+
+| 环节 | 结果 |
+|---|---|
+| 选题 | ✓ 3 条 |
+| 看懂 | ✓ 三条全读，含字幕 + ffmpeg 抽帧（`shots/subs/*debrief.txt`、`*-3x3.jpg`、`*-subs.jpg`） |
+| 评分 | ✓ 18 / 16 / 14；只发"当天第一且 ≥ 阈值"那条 |
+| 分享 | ✓ 评论真发（`rpid=317664224161`、`@主人`、18 分） |
+| 两本日记 | ✓ 公开 + 私人（私人本带「偏好校准」段落） |
+| QQ 报备 | ✓ 22:01:31 / 22:01:32 两条私聊到达主人（llbot 日志 `send_private_msg`）+ `whale-notify.log` |
+| 收藏 | ✗ → 已修（见 §2 的双写；`fav --list` 与 `selftest` 复验通过） |
+
+**这一轮暴露并修掉的 3 个问题**：
+
+1. **第一次分享没等主人过目就发了** —— 见 §3 的分享闸门。
+2. **收藏 `ENOENT`** —— 见 §2 的配置双写。
+3. **她看不见按函数的文档** —— Alife 的 `DocumentMode.Implicit` 只把模块的 `Description` / `Explanation` 送进她上下文，**不逐个列函数**；
+   她之所以知道 `BiliDeps`/`BiliFeed`，是因为**唤醒提示词里点了名**。结果 20 多个函数（诊断、待审草稿、发动态、贴 cookie……）她根本不知道存在，主人也就无法经她调用（"待审回复""她自己的动态"两个功能等于没通路）。
+   → 把完整**可用函数清单**写进 `Explanation`（那段一定会送到她），并注明"这些名字都真实存在，不要自己编"。
+
+**踩过的坑（都已修）**：.NET 的 `Encoding.UTF8` 会写 **BOM**，而 Node 的 `JSON.parse` 不认 BOM ——
+导致 `bili-whale.config.json` / `credentials.json` 解析失败并**静默退回内置默认值**（表现是：作息配置怎么改都不生效）。
+现在统一用不带 BOM 的 UTF-8，并加了启动自检把"实际读到的作息"打进日志。
+
+**操作注意（血的教训）**：`activate_character` 要 35–55 秒才真正完成，**期间不要发 `chat_with_character`** ——
+否则请求撞进正在激活的角色，会把 Alife 的 Web/MCP 宿主带崩（应用日志表现为 `Microsoft.AspNetCore.Components.Web.ErrorBoundary`，18765 端口消失，只能重启 Alife）。
+改配置的标准顺序：`set_module_config` → **等 ≥3 秒** → `reload_plugin` → `reload_character_config` → `deactivate_character` → 等 3 秒 → `activate_character` → **轮询到能读到角色上下文，再说话**。
+
+## 6. 已知限制 / 后续可选
+
+- **收藏**：`fav.mjs` 的路径 bug 已修（§2 双写），但日常流程仍未把它排进去（按当初约定算可选功能；她自己想收时可用 `BiliFav`）。
+- **未纳入本次范围**：私信监听（默认关，可开）、直播间弹幕（`danmaku`/`await`，上游还缺 `auto` 命令文件）。
+- **分享闸门是"一次性"的**：主人点头发出第一条 `auto="false"` 的分享后永久放开，之后她自主发（每日 ≤`ShareDaily`、同视频 7 天一次由上游 quota 强制）。想重新收紧就删 `<StateRoot>/share-gate.json`。
+- **上游 3 条命令缺失**（见 §2），都无关本范围。
+- **凭据会过期**：写操作前先跑 `BiliSession`；过期后所有写命令会明确报错而不是静默失败。
+- **Alife 必须开着**：生物钟/守夜都靠进程退出叫醒，Alife 关了就不会醒（上游 DSH 同理）。
+- **配置改动后旧计划会被沿用**：`whale-night.json` 里当天的 `wake`/`skip` 计划是**钉住**的；改了作息窗口要删掉这个文件（或跑 `BiliNightPlan`）才会重排。

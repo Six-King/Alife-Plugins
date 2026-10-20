@@ -1,0 +1,10 @@
+{
+  "Version": "4.6.1",
+  "Dependencies": {
+    "Alife.Function.FunctionCaller": ""
+  },
+  "Environments": {
+    "nuget": {},
+    "pip": {}
+  }
+}
