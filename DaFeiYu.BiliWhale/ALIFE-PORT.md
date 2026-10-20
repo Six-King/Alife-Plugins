@@ -207,3 +207,27 @@ OnUpdate()  →  每 10 个 tick（≈3 秒）比对模块配置文件时间戳
 - **凭据会过期**：写操作前先跑 `BiliSession`；过期后所有写命令会明确报错而不是静默失败。
 - **Alife 必须开着**：生物钟/守夜都靠进程退出叫醒，Alife 关了就不会醒（上游 DSH 同理）。
 - **配置改动后旧计划会被沿用**：`whale-night.json` 里当天的 `wake`/`skip` 计划是**钉住**的；改了作息窗口要删掉这个文件（或跑 `BiliNightPlan`）才会重排。
+
+## 7. 发布到插件市场（2026-10-20）
+
+- **源码仓库**：<https://github.com/Six-King/Alife-Plugins> —— 两个插件同一个仓库，各占一个目录（`DaFeiYu.BiliWhale/`、`DaFeiYu.MemePack/`）。
+- **发行包**：Release `v4.6.1`，资产名 `<插件id>_4.6.1.zip`。zip 内**文件放在根目录**（不套文件夹），解压即落到 `Storage\Plugins\<插件id>\`；`VERSION.txt` 由客户端自己写，包里不放。
+- **市场条目**：`DaFeiYu.BiliWhale.json` / `DaFeiYu.MemePack.json`，PR `BDFFZI/Alife.PluginMarket#394` 已由市场自带的 automerge 工作流（新文件免所有权检查）自动 squash 合并。
+- **署名与许可**：`author` = `鱼小晚的垃圾堆`；两个插件自有部分 MIT。市场描述与两个 `README.md` 都写明**作者不维护、请把插件目录交给 AI agent 改**。
+- **实测验证**：合并后从市场 `install_plugins` 装回来 —— 61 个文件与本地实测版逐文件 SHA256 **零差异**，`QChat`/`FunctionCaller` 依赖未被改动，装完插件立即正常运行。
+- **发布前的三处必改（下次发版别忘）**：
+  1. `manifest.json` 的 `Version` **首位必须与客户端一致**（客户端 4.6.1 → 写 `4.6.1`；官方清单文档明说「主版本号低于客户端：插件可能不兼容」）；
+  2. **隐私脱敏** —— 本文件里曾出现小号的昵称与 mid（已抹），发布前务必再扫一遍（cookie / 账号 mid / QQ / 本机路径）；
+  3. 两个插件都要**自带 LICENSE 与 README**（含不维护声明）；内置上游工具链的必须保留 `upstream-LICENSE` 与 `upstream-NOTICE.md`。
+- **发新版本流程**：改 `manifest.json` 版本 → 重打 zip（文件在根）→ 新建 tag + Release 并上传资产 → 在市场 JSON 的 `releases` 里加 `"x.y.z"`（`file` 指向新资产）→ 向市场仓库提 PR（同一账号的后续 PR 也能过所有权检查）。
+
+## 8. 日记的落地契约（2026-10-20 改：纯文本 txt）
+
+- 两本日记是**纯文本 txt**，默认落在 `<运行时目录>\RJ`（本机 = `K:\AI\Alife\Runtime\RJ`）：
+  `养鱼日记.txt`（给主人的信）、`养鱼日记-私密.txt`（她自己那本，不加滤镜）。
+  三个配置项「日记目录 / 公开日记文件名 / 私密日记文件名」都在设置页，**热开关即时生效**；「日记目录」留空 = 运行时目录下的 `RJ`（别写死绝对路径，别人装的 Alife 不在 K 盘）。
+- **写日记一律走 `<BiliDiaryWrite to="owner|me" text="…"/>`**：由插件追加 + 盖时间戳（`—— 10月20日 23:44 ——`）。
+  ⚠️ 不要让模型"读全文再写回"，也**不要改用文件工具追加** —— `FileService` 只有 `<Write>`（覆盖）和 `<Edit>`（替换），**没有 append**；日记越长，重写的代价越大、越容易截断。
+- 格式约定：纯文本，不要 markdown（不要 `#` 标题、`**` 加粗、表格），段落之间空一行。
+- 上游 `diary.mjs` 的职责只有两件：写事件流 `whale-log.jsonl`、`show` 读日记。为读新文件，插件给子进程传 `WHALE_DIARY_FILE` —— 这是对上游的**第 3 处**改动（另 2 处是显示文本）。
+- `.md` 时代的两本留在 `PluginData\<id>\home\.dsh\` 作留档；搬家由 `Prepare()` 执行一次，标记文件 `PluginData\<id>\diary-migrated.marker`（改了日记目录不会重搬）。

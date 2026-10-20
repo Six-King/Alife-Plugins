@@ -26,7 +26,8 @@ for (let i = 1; i < argv.length; i += 1) {
   else if (!opt._a) opt._a = argv[i]
 }
 const HOME = (process.env.USERPROFILE || process.env.HOME || '/')
-const DIARY = path.join(HOME, '.dsh', 'whale-diary.md')
+// 日记已改成纯文本 txt（2026-10-20）：插件用 WHALE_DIARY_FILE 指过来，没设才回退到老的 .md 路径
+const DIARY = process.env.WHALE_DIARY_FILE || path.join(HOME, '.dsh', 'whale-diary.md')
 const QUOTA = path.join(HOME, '.bili-ai', 'quota.json')
 const LOG = path.join(HOME, '.dsh', 'whale-log.jsonl')
 const today = () => new Date().toLocaleDateString('sv-SE')

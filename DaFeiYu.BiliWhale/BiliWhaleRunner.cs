@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Alife.Platform;
 using Microsoft.Extensions.Logging;
 
 namespace DaFeiYu.BiliWhale;
@@ -98,8 +99,74 @@ internal sealed class BiliWhaleRunner
     public bool CredentialsPresent =>
         !string.IsNullOrWhiteSpace(_cfg.Sessdata) && !string.IsNullOrWhiteSpace(_cfg.BiliJct);
 
-    public string DiaryFile => Path.Combine(DshDir, "whale-diary.md");
-    public string PrivateDiaryFile => Path.Combine(DshDir, "whale-diary-private.md");
+    /// <summary>两本日记（纯文本 txt）落在哪：配置留空 → 运行时目录下的 RJ（默认 K:\AI\Alife\Runtime\RJ）。</summary>
+    public string DiaryDir
+    {
+        get
+        {
+            var d = (_cfg.DiaryDir ?? "").Trim();
+            if (d.Length == 0) d = Path.Combine(AlifePath.RuntimeFolderPath, "RJ");
+            return d;
+        }
+    }
+
+    /// <summary>文件名洗一遍：空的用默认名，非法字符换成 _，没写 .txt 自动补。</summary>
+    static string SafeDiaryName(string? raw, string fallback)
+    {
+        var n = (raw ?? "").Trim();
+        if (n.Length == 0) n = fallback;
+        foreach (var c in Path.GetInvalidFileNameChars()) n = n.Replace(c, '_');
+        n = n.Replace('/', '_').Replace('\\', '_');
+        if (!n.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) n += ".txt";
+        return n;
+    }
+
+    public string DiaryFile => Path.Combine(DiaryDir, SafeDiaryName(_cfg.DiaryName, "养鱼日记.txt"));
+    public string PrivateDiaryFile => Path.Combine(DiaryDir, SafeDiaryName(_cfg.PrivateDiaryName, "养鱼日记-私密.txt"));
+
+    /// <summary>.md 时代的旧日记（只用于一次性搬家和留档，不再往里写）。</summary>
+    public string LegacyDiaryFile => Path.Combine(DshDir, "whale-diary.md");
+    public string LegacyPrivateDiaryFile => Path.Combine(DshDir, "whale-diary-private.md");
+
+    /// <summary>把 .md 时代的日记一次性搬进新的 txt（新文件已存在就跳过；旧的保留不删）。
+    /// 用标记文件保证**一辈子只搬一次** —— 否则改了「日记目录」会又把旧 .md 抄进新目录。</summary>
+    public void MigrateLegacyDiaries()
+    {
+        try { if (File.Exists(DiaryMigratedMarker)) return; } catch { return; }
+        MigrateOne(LegacyDiaryFile, DiaryFile);
+        MigrateOne(LegacyPrivateDiaryFile, PrivateDiaryFile);
+        try { File.WriteAllText(DiaryMigratedMarker, $"已把 .md 日记搬进 {DiaryDir}{Environment.NewLine}", new UTF8Encoding(false)); }
+        catch { }
+    }
+
+    public string DiaryMigratedMarker => Path.Combine(StateRoot, "diary-migrated.marker");
+
+    static void MigrateOne(string oldFile, string newFile)
+    {
+        try
+        {
+            if (!File.Exists(oldFile) || File.Exists(newFile)) return;
+            var lines = new List<string>
+            {
+                $"（这一本原来写在 .md 里，{DateTime.Now:yyyy-MM-dd} 起改成纯文本 txt —— 下面是搬过来的旧内容，接着往下写就行）",
+                ""
+            };
+            foreach (var raw in File.ReadAllText(oldFile).Replace("\r\n", "\n").Split('\n'))
+            {
+                var l = raw.TrimEnd();
+                if (l.StartsWith("## ", StringComparison.Ordinal)) l = "—— " + l.Substring(3).Trim() + " ——";
+                else if (l.StartsWith("# ", StringComparison.Ordinal)) l = "—— " + l.Substring(2).Trim() + " ——";
+                lines.Add(l.Replace("**", ""));
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(newFile)!);
+            File.WriteAllText(newFile, string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine, new UTF8Encoding(false));
+        }
+        catch
+        {
+            // 搬家失败不影响主流程（她照样能往新文件里写）
+        }
+    }
+
     public string NightStateFile => Path.Combine(DshDir, "whale-night.json");
     public string QuotaFile => Path.Combine(BiliAiDir, "quota.json");
     public string FeedbackFile => Path.Combine(BiliAiDir, "feedback.json");
@@ -113,6 +180,8 @@ internal sealed class BiliWhaleRunner
         Directory.CreateDirectory(StateRoot);
         Directory.CreateDirectory(HomeDir);
         Directory.CreateDirectory(BiliAiDir);
+        Directory.CreateDirectory(DiaryDir);      // 两本 txt 日记（默认 运行时\RJ）
+        MigrateLegacyDiaries();                    // .md 时代的两本搬过来（只搬一次）
         Directory.CreateDirectory(DshDir);
 
         NodeExe = DetectNode();
@@ -409,6 +478,7 @@ internal sealed class BiliWhaleRunner
         psi.Environment["BILI_WHALE_CONFIG"] = ToolConfigFile;   // lib/config.mjs 认它
         psi.Environment["WHALE_CFG"] = ToolConfigFile;           // 部分脚本认它
         psi.Environment["DSH_HOME"] = DshDir;
+        psi.Environment["WHALE_DIARY_FILE"] = DiaryFile;         // diary.mjs show 认它（否则只找 HOME 下的老 .md）
         psi.Environment["NODE_NO_WARNINGS"] = "1";
         if (FfmpegPath.Length > 0) psi.Environment["FFMPEG"] = FfmpegPath;
         _ = longRunning;

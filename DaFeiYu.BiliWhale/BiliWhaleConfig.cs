@@ -134,6 +134,18 @@ public class BiliWhaleConfig
     [Description("关掉=她照写两本日记，但不推给你（日记本身不能关）")]
     public bool DiaryPush { get; set; } = true;
 
+    [DisplayName("日记目录")]
+    [Description("两本日记 txt 放在哪。留空 = 运行时目录下的 RJ（默认 K:\\AI\\Alife\\Runtime\\RJ）")]
+    public string DiaryDir { get; set; } = "";
+
+    [DisplayName("公开日记文件名")]
+    [Description("给主人看的那本 txt。默认 养鱼日记.txt（没写 .txt 会自动补）")]
+    public string DiaryName { get; set; } = "养鱼日记.txt";
+
+    [DisplayName("私密日记文件名")]
+    [Description("她自己那本 txt（不加滤镜）。默认 养鱼日记-私密.txt")]
+    public string PrivateDiaryName { get; set; } = "养鱼日记-私密.txt";
+
     [DisplayName("通知方式")]
     [Description("qq=让她用 QChat 私聊发给你（推荐）；file=只写进通知日志，不发消息")]
     public string NotifyType { get; set; } = "qq";

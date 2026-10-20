@@ -434,10 +434,10 @@ public partial class BiliWhaleModule
         if (!CredentialsReady)
         {
             sb.AppendLine("⚠️ 现在**没有配 B站 cookie**：第 1 步体检一定是红的。这趟你只做一件事 —— 报备告诉主人「缺 cookie，配好我才能刷」，"
-                        + "**不要尝试任何对外发的东西**，也不用写视频日记（写一段「我还没能出门」的心情就好）。");
+                        + "**不要尝试任何对外发的东西**，也不用写视频日记（用 <BiliDiaryWrite to=\"me\" text=\"…\"/> 写一段「我还没能出门」的心情就好）。");
         }
         sb.AppendLine("1) <BiliDeps/> —— 体检红着就只做读、不要对外发");
-        sb.AppendLine("2) <BiliDiaryShow/> 读两本日记（路径见 <BiliDiaryPaths/>），先想清楚今天想找什么");
+        sb.AppendLine("2) <BiliDiaryShow/> 读两本日记（txt，路径见 <BiliDiaryPaths/>），先想清楚今天想找什么");
         sb.AppendLine($"3) <BiliFeed n=\"{maxVideos}\"/> 选题 → 对这 {maxVideos} 条跑 <BiliDebrief bvid=\"BV…\" frames=\"false\"/> 初筛（便宜，不出图）");
         sb.AppendLine("4) 从里面挑 2–3 条深读：<BiliDebrief bvid=\"BV…\" frames=\"true\"/>（含抽帧看画面）");
         sb.AppendLine($"5) 按标尺给深读过的打分（每项 0–4，满分 20）。只有 ≥{Cfg.MinScore} 分、且是当天第一名才考虑分享；不足线就少发或不发（那是合法结果）：");
@@ -464,7 +464,7 @@ public partial class BiliWhaleModule
             sb.AppendLine("   ⚠️ 只拦「分享型」；回别人的评论、收藏、写日记都不受影响，照常做。");
         }
         sb.AppendLine("6) 深读过的里面，如果某条「我想留着」→ <BiliFav bvid=\"BV…\" reason=\"为什么留（≥6字）\" dry=\"true\"/> → dry=\"false\"（一天 ≤3 条、同一视频 30 天一次、**不占分享额度**；「看完就完」的不收）");
-        sb.AppendLine("7) 写两本日记（用文件工具直接写，散文体 + 想说的话；私人那本加一段「偏好校准」）");
+        sb.AppendLine("7) 写两本日记：<BiliDiaryWrite to=\"owner\" text=\"…\"/> 给主人的信 + <BiliDiaryWrite to=\"me\" text=\"…\"/> 自己那本（散文体纯文本，不要 markdown；私人那本加一段「偏好校准」）");
         sb.AppendLine("8) <BiliCommentDigest hours=\"24\"/> —— 每轮最后都扫一遍「谁找过我」，有没回的评论就一起处理（不是一条条报）");
         sb.AppendLine("9) <BiliQuotaReact hours=\"48\"/> —— 扫一遍主人有没有表态（点赞也算），有就记反馈、并写进私人日记的「偏好校准」");
         if (faint) sb.AppendLine("5.5) ⛔ 沉默太久 → **今天不分享**（只看 + 两本日记 + 报备一句）");
@@ -483,7 +483,7 @@ public partial class BiliWhaleModule
         sb.AppendLine($"【今晚不看】{detail}");
         sb.AppendLine();
         sb.AppendLine("按「不看的那晚」做（不要等我说话，直接做）：");
-        sb.AppendLine("1) **两本日记都要写**，而且要写清「为什么不想看」（累 / 没吃饱 / 心情不好 / 就是不想……不许只写「跳过」两个字）");
+        sb.AppendLine("1) **两本日记都要写**（用 <BiliDiaryWrite to=\"me\" text=\"…\"/> 和 to=\"owner\"），而且要写清「为什么不想看」（累 / 没吃饱 / 心情不好 / 就是不想……不许只写「跳过」两个字）");
         sb.AppendLine("2) <BiliDiaryLog kind=\"night-skip\" note=\"…理由…\"/>");
         sb.AppendLine("3) <BiliCommentDigest hours=\"24\"/> 扫一眼有没有没回的评论");
         sb.AppendLine("4) <BiliNotify message=\"…\"/>：推「日记里最想对我说的那一段」+ 今天谁找过你");
