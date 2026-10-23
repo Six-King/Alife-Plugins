@@ -1,0 +1,9 @@
+{
+  "name": "bili-whale-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "B站养鱼插件工具链的 Node 依赖（只给 tools/ 下的脚本用；插件本体是 C#）",
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}

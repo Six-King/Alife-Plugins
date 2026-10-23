@@ -1,7 +1,9 @@
 {
-  "Version": "4.6.2",
+  "Version": "5.0.0",
   "Dependencies": {
-    "Alife.Function.FunctionCaller": ""
+    "Alife.Function.FunctionCaller": "",
+    "Alife.Function.AIModelUtility": "",
+    "Alife.Function.QChat": ""
   },
   "Environments": {
     "nuget": {},

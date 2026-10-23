@@ -6,6 +6,9 @@ import crypto from 'node:crypto'
 const kw = process.argv[2]
 const page = Number(process.argv[3] ?? 1)
 if (!kw) { console.error('用法: node search.mjs <关键词> [页码]'); process.exit(2) }
+// 2026-10-22 修（Codex 实测 #1）：页码不合法要显式报错 ✗
+//   以前 --ps 2 这种会被解析成 NaN → 请求 -400 → 但退出码还是 0 ✗
+if (!Number.isInteger(page) || page < 1) { console.error('页码必须是正整数：' + JSON.stringify(process.argv[3])); process.exit(2) }
 
 const cred = JSON.parse(fs.readFileSync(path.join((process.env.USERPROFILE || process.env.HOME || '/'), '.bili-ai', 'credentials.json'), 'utf8'))
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -34,6 +37,11 @@ console.log(`搜索「${kw}」 page=${page}  code=${d.code} ${d.message ?? ''}  
 if (d.code !== 0 || !list.length) {
   console.log(`data 的字段: ${Object.keys(d.data ?? {}).join(', ') || '(空)'}`)
   if (!list.length) console.log(JSON.stringify(d).slice(0, 400))
+  // 2026-10-22 修（Codex 实测 #1）：接口失败必须非 0 ✗
+  //   只有「接口成功但确实没结果」才算正常结束 ✓
+  //   （上层自动化拿到 0 就当成功，失败也 0 会被误报 ✗）
+  if (d.code !== 0) { console.error(`✗ 搜索接口失败 code=${d.code} ${d.message ?? ''}`); process.exit(4) }
+  console.log('（接口正常，但没有搜到结果）')
   process.exit(0)
 }
 for (const [i, r] of list.entries()) {

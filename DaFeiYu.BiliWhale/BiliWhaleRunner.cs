@@ -99,7 +99,7 @@ internal sealed class BiliWhaleRunner
     public bool CredentialsPresent =>
         !string.IsNullOrWhiteSpace(_cfg.Sessdata) && !string.IsNullOrWhiteSpace(_cfg.BiliJct);
 
-    /// <summary>两本日记（纯文本 txt）落在哪：配置留空 → 运行时目录下的 RJ（默认 K:\AI\Alife\Runtime\RJ）。</summary>
+    /// <summary>两本日记（纯文本 txt）落在哪：配置留空 → 运行时目录下的 RJ（默认：运行时目录下的 RJ）。</summary>
     public string DiaryDir
     {
         get
@@ -170,8 +170,23 @@ internal sealed class BiliWhaleRunner
     public string NightStateFile => Path.Combine(DshDir, "whale-night.json");
     public string QuotaFile => Path.Combine(BiliAiDir, "quota.json");
     public string FeedbackFile => Path.Combine(BiliAiDir, "feedback.json");
-    /// <summary>「第一次分享必须先报备」的闸门状态（主人授权发出过第一条分享 → 永久放开）。</summary>
+    /// <summary>分享闸门状态（主人授权发出过第一条分享 → 永久放开）。</summary>
     public string ShareGateFile => Path.Combine(StateRoot, "share-gate.json");
+
+    // ==================== 截图 / 抽帧目录（与工具链共用同一套 HOME）====================
+    // 上游脚本按 os.homedir() 推路径，而 HOME 被我们换成了 HomeDir —— 所以这些目录
+    // 就是插件数据目录里的那些，读它写它都等于跟工具链"看同一批文件"。
+
+    public string ShotsDir => Path.Combine(DshDir, "shots");
+    public string ShotsVideoDir => Path.Combine(ShotsDir, "video");     // 原片 mp4 + 九宫格
+    public string ShotsSubsDir => Path.Combine(ShotsDir, "subs");       // 字幕（json/txt/plain）
+    public string ShotsCoversDir => Path.Combine(ShotsDir, "covers");   // 封面 jpg
+    /// <summary>深读自己抽的逐帧图。上游抽完就删了，我们留着 —— 她事后想回头看还有得看。</summary>
+    public string FramesDir => Path.Combine(ShotsDir, "frames");
+    /// <summary>@我 通知的水位线（只记"通知到哪一秒"，**不动 B站 自己的已读状态**）。</summary>
+    public string MentionStateFile => Path.Combine(StateRoot, "mention-state.json");
+    /// <summary>配图转码/上传的临时目录。</summary>
+    public string TempDir => Path.Combine(StateRoot, "temp");
 
     // ==================== 探测 ====================
 
@@ -183,6 +198,9 @@ internal sealed class BiliWhaleRunner
         Directory.CreateDirectory(DiaryDir);      // 两本 txt 日记（默认 运行时\RJ）
         MigrateLegacyDiaries();                    // .md 时代的两本搬过来（只搬一次）
         Directory.CreateDirectory(DshDir);
+        Directory.CreateDirectory(ShotsDir);      // 与工具链共用：shots/{video,subs,covers}
+        Directory.CreateDirectory(FramesDir);     // 深读的逐帧图（上游删，我们留）
+        Directory.CreateDirectory(TempDir);       // 配图转码
 
         NodeExe = DetectNode();
         FfmpegPath = DetectFfmpeg();
@@ -293,7 +311,9 @@ internal sealed class BiliWhaleRunner
 
     // ==================== 配置与凭据同步 ====================
 
-    /// <summary>凭据单独落盘（工具链只认这个文件）；只写不读回，任何地方都不回显。</summary>
+    /// <summary>凭据单独落盘（工具链只认这个文件）；只写不读回，任何地方都不回显。
+    /// ⑰-3：扫码登录拿到的 access_token 若存在就一并带上（不存在时文件内容与以前**完全一样**，
+    /// 所以老的 cookie 流程读写的还是那三个键，语义没变 ✓）。</summary>
     public void SyncCredentials()
     {
         try
@@ -305,6 +325,8 @@ internal sealed class BiliWhaleRunner
                 ["bili_jct"] = _cfg.BiliJct?.Trim() ?? "",
                 ["buvid3"] = _cfg.Buvid3?.Trim() ?? "",
             };
+            var token = _cfg.AccessToken?.Trim() ?? "";
+            if (token.Length > 0) obj["access_token"] = token;
             File.WriteAllText(Path.Combine(BiliAiDir, "credentials.json"),
                 JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true }) + "\n", Utf8NoBom);
         }
@@ -479,6 +501,12 @@ internal sealed class BiliWhaleRunner
         psi.Environment["WHALE_CFG"] = ToolConfigFile;           // 部分脚本认它
         psi.Environment["DSH_HOME"] = DshDir;
         psi.Environment["WHALE_DIARY_FILE"] = DiaryFile;         // diary.mjs show 认它（否则只找 HOME 下的老 .md）
+        // 2026-10-22：feed.mjs 的「已看过」名单也要读她私密那本（里面写着"这条看了、几分"）——
+        //   上游没有这个变量，属于本移植的第 4 处 tools/ 改动（JS 侧是可选读，没传也不报错）
+        psi.Environment["WHALE_DIARY_PRIVATE_FILE"] = PrivateDiaryFile;
+        // ★ v0.4.5 起 lib/runtime.mjs 会自己找 node（先 DSH_NODE，再 dsh-runtimes/PATH/ProgramFiles）
+        //   不锁死就可能挑到版本不对的 node，甚至在 import 期抛错让所有命令失效 → 显式指向插件在用的那个
+        if (NodeExe.Length > 0) psi.Environment["DSH_NODE"] = NodeExe;
         psi.Environment["NODE_NO_WARNINGS"] = "1";
         if (FfmpegPath.Length > 0) psi.Environment["FFMPEG"] = FfmpegPath;
         _ = longRunning;
@@ -493,11 +521,25 @@ internal sealed class BiliWhaleRunner
 
         var list = new List<string> { BiliMjs, cmd };
         if (args != null) list.AddRange(args.Where(a => !string.IsNullOrEmpty(a)));
+        return await RunProcAsync(NodeExe, list, timeoutSec ?? _cfg.CommandTimeoutSec, ct, cmd);
+    }
 
-        var timeout = Math.Max(15, timeoutSec ?? _cfg.CommandTimeoutSec);
+    /// <summary>ffmpeg 能用吗（抽帧、webp→jpg 转码都要它）。</summary>
+    public bool FfmpegReady => FfmpegPath.Length > 0 && File.Exists(FfmpegPath);
+
+    /// <summary>跑一次 ffmpeg。它不是 node 工具链，所以单独一条通道（复用同一条进程管道）。</summary>
+    public async Task<BiliRunResult> RunFfmpegAsync(IReadOnlyList<string> args, int timeoutSec = 120, CancellationToken ct = default)
+    {
+        if (!FfmpegReady) return BiliRunResult.Fail("找不到 ffmpeg（先在配置里填「ffmpeg 可执行文件」）");
+        return await RunProcAsync(FfmpegPath, args.ToList(), timeoutSec, ct, "ffmpeg");
+    }
+
+    async Task<BiliRunResult> RunProcAsync(string exe, IReadOnlyList<string> args, int timeoutSec, CancellationToken ct, string label)
+    {
+        var timeout = Math.Max(15, timeoutSec);
         try
         {
-            using var p = new Process { StartInfo = BuildPsi(NodeExe, list) };
+            using var p = new Process { StartInfo = BuildPsi(exe, args) };
             var so = new StringBuilder();
             var se = new StringBuilder();
             p.OutputDataReceived += (_, e) => { if (e.Data != null) lock (so) so.AppendLine(e.Data); };
@@ -520,7 +562,7 @@ internal sealed class BiliWhaleRunner
                     Started = true,
                     ExitCode = -1,
                     Out = Lock(so),
-                    Failure = $"命令超时（{timeout}s）：{cmd}",
+                    Failure = $"命令超时（{timeout}s）：{label}",
                 };
             }
             try { p.WaitForExit(); } catch { }
@@ -535,7 +577,7 @@ internal sealed class BiliWhaleRunner
         }
         catch (Exception e)
         {
-            Log($"运行 {cmd} 异常：{e.Message}", error: true);
+            Log($"运行 {label} 异常：{e.Message}", error: true);
             return BiliRunResult.Fail(e.Message);
         }
     }

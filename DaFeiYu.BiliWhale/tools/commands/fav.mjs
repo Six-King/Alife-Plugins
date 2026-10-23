@@ -1,3 +1,4 @@
+import { apiGet } from '../lib/bili-api.mjs'
 // 收藏（2026-10-20 加，主人定：收藏 ≠ 低配的分享，是"我想留着"）
 //
 // 用法:
@@ -13,11 +14,21 @@
 //   ⑤ 先 --dry 再 --go（和其它写操作一致）
 import fs from 'node:fs'
 import path from 'node:path'
+import { dshPath } from '../lib/paths.mjs'
+
 
 const HOME = (process.env.USERPROFILE || process.env.HOME || '/')
 const FAV_LOG = path.join(HOME, '.bili-ai', 'favorites.json')
-const cred = JSON.parse(fs.readFileSync(path.join(HOME, '.bili-ai', 'credentials.json'), 'utf8'))
-const cfg = JSON.parse(fs.readFileSync(path.join(HOME, '.dsh', 'bili-whale.config.json'), 'utf8'))
+// 2026-10-21 修（外部审计 #10）：新用户跑 `fav --list` 会因为缺文件直接一脸 ENOENT ✗
+//   改成友好提示：--list 不需要凭据（只读本地账本），其它子命令才要 ✓
+let cred = { sessdata: '', bili_jct: '', buvid3: '' }
+let cfg = {}
+try {
+  cred = JSON.parse(fs.readFileSync(path.join(HOME, '.bili-ai', 'credentials.json'), 'utf8'))
+} catch {}
+try {
+  cfg = JSON.parse(fs.readFileSync(dshPath('bili-whale.config.json'), 'utf8'))
+} catch {}
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const cookie = `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3 ?? ''}`
 const H = { 'user-agent': UA, referer: 'https://www.bilibili.com/', cookie }
@@ -72,8 +83,8 @@ if (opt.list) {
 
 // ── 取她的默认收藏夹 id ────────────────────────────────────
 async function defaultFavId() {
-  const r = await fetch(`https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=${selfMid}`, { headers: H })
-  const j = await r.json()
+  const j = await apiGet(`https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=${selfMid}`, H)
+  if (j.code !== 0) throw new Error(`取收藏夹失败：${j.message ?? j.code}`)
   const list = j.data?.list ?? []
   const pick = list.find((f) => /默认/.test(f.title)) ?? list[0]
   if (!pick) throw new Error('这个号还没有任何收藏夹（B站默认会建一个"默认收藏夹"，没有就得先在网页上收藏一次）')
@@ -82,8 +93,7 @@ async function defaultFavId() {
 
 // ── 取 aid + 标题 ────────────────────────────────────────
 async function videoInfo(bv) {
-  const r = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bv}`, { headers: H })
-  const j = await r.json()
+  const j = await apiGet(`https://api.bilibili.com/x/web-interface/view?bvid=${bv}`, H)
   if (j.code !== 0) throw new Error(`取视频信息失败：code=${j.code} ${j.message ?? ''}`)
   return { aid: j.data.aid, title: String(j.data.title ?? ''), up: String(j.data.owner?.name ?? '') }
 }
@@ -95,7 +105,8 @@ function checkRules({ bv, reason, better, kind }) {
   if (!reason || String(reason).trim().length < 6) return '理由太短（≥6 字）—— 说不清为什么留，就不收 ✗'
   const todayCount = items.filter((x) => new Date(x.at).toLocaleDateString('sv-SE') === today()).length
   if (todayCount >= 3) return `今天已经收了 ${todayCount} 条（上限 3）—— 剩下的明天再说 ✓`
-  const same = items.find((x) => x.bv === bv)
+  const same = items.filter((x) => x.bv === bv)
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]
   if (same) {
     const days = Math.floor((Date.now() - new Date(same.at).getTime()) / DAY)
     if (days < 30) return `这个 ${days} 天前收过了（30 天内不重复）✓`
@@ -126,8 +137,15 @@ const kind = String(opt.kind ?? '') || inferKind(reason)
 const bad = checkRules({ bv, reason, better: !!opt.better, kind })
 if (bad) { console.error(`✗ 不能收：${bad}`); process.exit(3) }
 
-const info = await videoInfo(bv)
-const fav = await defaultFavId()
+// 写操作才需要凭据（--list / --check 不需要）
+if (!cred.sessdata || !cred.bili_jct) {
+  console.error('✗ 还没配置 B站 凭据，没法收藏')
+  console.error('  去设置页粘贴 SESSDATA + bili_jct 并保存（只读的 fav --list 不需要凭据 ✓）')
+  process.exit(2)
+}
+let info, fav
+try { info = await videoInfo(bv); fav = await defaultFavId() }
+catch (error) { console.error(error.message); process.exit(3) }
 console.log(`[fav] ${bv}  「${info.title.slice(0, 44)}」  @${info.up}`)
 console.log(`  理由：${reason}`)
 console.log(`  类别：${String(opt.kind ?? '') || inferKind(reason)}（可选 --kind 想学|想再看|和我有关|以后要提 覆盖）`)
@@ -150,7 +168,15 @@ const r = await fetch('https://api.bilibili.com/x/v3/fav/resource/deal', {
 })
 const j = await r.json()
 if (j.code !== 0) {
-  console.error(`  ✗ 收藏失败：code=${j.code} ${j.message ?? ''}${j.code === -111 ? '（csrf 失效，重新登录一次）' : ''}`)
+  // 2026-10-21：把常见返回码翻译成人话 —— 裸的 -111 用户完全看不懂 ✗
+  const HINT = {
+    '-101': '账号未登录：SESSDATA 失效，重新复制一次 cookie',
+    '-111': 'CSRF 校验失败：bili_jct 和当前 SESSDATA 不是同一账号，或已过期 → 两个都重新复制一次',
+    '-352': '风控拦截：等几分钟再来',
+    10031: '操作太快：退避一会儿',
+    12015: '需要验证码：停下，去浏览器手动过一次',
+  }
+  console.error(`  ✗ 收藏失败：code=${j.code} ${HINT[String(j.code)] ?? (j.message ?? '未知错误')}`)
   process.exit(4)
 }
 

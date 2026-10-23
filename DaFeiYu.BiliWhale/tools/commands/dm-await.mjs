@@ -3,10 +3,15 @@
 //   用法:
 //     node dm-await.mjs --baseline          把当前状态记为"已读"，从现在起只认新消息
 //     node dm-await.mjs --once [--json]     轮询一次（命中打印 DM_HIT）
+//     node dm-await.mjs --once --json --peek  持久化待交付消息，返回 receipt
+//     node dm-await.mjs --ack <receipt>    宿主成功接收后确认，不访问网络
 //     node dm-await.mjs --interval 20       持续轮询（插件里用 --once 自带循环 ✗）
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { config } from '../lib/config.mjs'
+import { parseDmContent } from '../lib/dm-content.mjs'
+import { resolveUid } from '../lib/uid.mjs'
 
 const argv = process.argv.slice(2)
 const opt = {}
@@ -20,26 +25,39 @@ for (let i = 0; i < argv.length; i += 1) {
 const BASE = !!opt.baseline
 const ONCE = !!opt.once || BASE
 const JSONOUT = !!opt.json
+const PEEK = !!opt.peek
 
 const U = process.env.USERPROFILE || process.env.HOME || '/'
 const STATE = path.join(U, '.bili-ai', 'dm-await-state.json')
 const c = JSON.parse(fs.readFileSync(path.join(U, '.bili-ai', 'credentials.json'), 'utf8'))
 const cfg = config()
-const OWNER = String(cfg.owner?.mid ?? '').trim()
-const OWNER_NAME = String(cfg.owner?.name ?? '主人')
-if (!OWNER) { console.error('✗ 配置里 owner.mid 为空'); process.exit(2) }
+let OWNER = String(cfg.owner?.mid ?? '').trim()
+const OWNER_NAME = String(cfg.owner?.name ?? '主人').trim()
+// 2026-10-23：owner.mid 空/非数字时**不再直接退出** —— 用昵称查一次 UID（只读 + 落缓存，参照 dsh-bili-scroll 的 lib/uid.mjs）。
+// ⚠️ 只在 mid 不是数字时才查：**绝不覆盖已填好的 mid** ✓
+if (!/^\d+$/.test(OWNER)) {
+  const found = await resolveUid(OWNER_NAME, { log: (m) => console.error('· ' + m) })
+  if (found > 0) { OWNER = String(found); console.error(`（配置里 owner.mid 不是数字，用昵称「${OWNER_NAME}」查到 mid=${found}）`) }
+  else { console.error(`✗ 配置里 owner.mid 不是数字（「${OWNER}」），用昵称「${OWNER_NAME}」也没查到 UID`); process.exit(2) }
+}
 
 const H = {
   'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   referer: 'https://www.bilibili.com/',
   cookie: `SESSDATA=${c.sessdata}; bili_jct=${c.bili_jct}; buvid3=${c.buvid3}`,
 }
-const loadState = () => { try { return JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch { return {} } }
-const saveState = (o) => { fs.mkdirSync(path.dirname(STATE), { recursive: true }); fs.writeFileSync(STATE, JSON.stringify(o, null, 2) + '\n') }
-const parsed = (content) => {
-  // 私信内容可能是 {"content":"…"} 或纯文本
-  try { const j = JSON.parse(String(content)); return String(j.content ?? j.text ?? content) } catch { return String(content ?? '') }
+const loadState = () => {
+  try { return JSON.parse(fs.readFileSync(STATE, 'utf8')) }
+  catch (error) { if (error.code === 'ENOENT') return {}; throw new Error('私信状态无法读取，已停止推进已读位置：' + error.message) }
 }
+const saveState = (o) => {
+  fs.mkdirSync(path.dirname(STATE), { recursive: true })
+  const temp = STATE + '.' + process.pid + '.tmp'
+  try { fs.writeFileSync(temp, JSON.stringify(o, null, 2) + '\n'); fs.renameSync(temp, STATE) }
+  finally { fs.rmSync(temp, { force: true }) }
+}
+// 私信内容解析：2026-10-23 起支持 msg_type 7/8 的**分享卡**（解析在 lib，便于单独自测）
+const parsed = (content, msgType = 1) => parseDmContent(content, msgType)
 
 async function poll() {
   const u = 'https://api.vc.bilibili.com/session_svr/v1/session_svr/get_sessions?session_type=1&group_id=0&count=20&mobi_app=web'
@@ -51,33 +69,52 @@ async function poll() {
   if (!mine) return { ok: true, hit: false, why: '没找到主人的会话' }
   const last = mine.last_msg ?? {}
   const ts = Number(last.timestamp ?? 0)
-  const text = parsed(last.content)
+  const text = parsed(last.content, last.msg_type)
   const sender = Number(last.sender_uid ?? 0)
   const fromOwner = String(sender) === OWNER      // 只有主人发的才算
-  return { ok: true, ts, text, fromOwner, unread: Number(mine.unread_count ?? 0) }
+  const key = String(last.msg_key ?? last.msg_seqno ?? crypto.createHash('sha256').update(JSON.stringify([ts, sender, text])).digest('hex'))
+  return { ok: true, ts, key, text, fromOwner, unread: Number(mine.unread_count ?? 0) }
 }
 
 if (BASE) {
   const r = await poll()
   if (!r.ok) { console.error(`✗ ${r.why}`); process.exit(3) }
-  saveState({ lastSeen: r.ts || 0, at: new Date().toISOString() })
+  saveState({ owner: OWNER, lastSeen: r.ts || 0, lastKey: r.key, at: new Date().toISOString() })
   console.log(`已把当前私信状态标记为已读（lastSeen=${r.ts}）✓ 从现在起只认新消息`)
   process.exit(0)
 }
 
-const st = loadState()
+let st = loadState()
+if (st.owner && st.owner !== OWNER) st = {}
+// Scheduler delivery is two-phase: persist a receipt before returning a hit,
+// acknowledge only once the host accepts the prompt. Retries read the same hit.
+if (opt.ack) {
+  if (!st.pending || st.pending.receipt !== String(opt.ack) || st.pending.mid !== OWNER) {
+    console.error('私信确认凭据不匹配，未推进已读状态'); process.exit(2)
+  }
+  saveState({ owner: OWNER, lastSeen: st.pending.ts, lastKey: st.pending.key, at: new Date().toISOString() })
+  console.log('私信交付已确认'); process.exit(0)
+}
+if (st.pending?.mid === OWNER) {
+  console.log(JSONOUT ? JSON.stringify(st.pending) : `DM_HIT mid=${OWNER} ts=${st.pending.ts} text=${st.pending.text}`)
+  process.exit(0)
+}
 const r = await poll()
 if (!r.ok) { console.error(`✗ ${r.why}`); process.exit(3) }
 const lastSeen = Number(st.lastSeen ?? 0)
-const hit = r.ts > lastSeen && r.fromOwner
+const hit = r.fromOwner && (r.ts > lastSeen || (r.ts === lastSeen && st.lastKey && r.key !== st.lastKey))
 if (hit) {
-  saveState({ lastSeen: r.ts, at: new Date().toISOString() })
-  if (JSONOUT) console.log(JSON.stringify({ hit: true, mid: OWNER, name: OWNER_NAME, text: r.text, ts: r.ts }))
+  const result = { hit: true, mid: OWNER, name: OWNER_NAME, text: r.text, ts: r.ts, key: r.key }
+  if (PEEK) {
+    result.receipt = crypto.randomUUID()
+    saveState({ ...st, owner: OWNER, pending: result })
+  } else saveState({ owner: OWNER, lastSeen: r.ts, lastKey: r.key, at: new Date().toISOString() })
+  if (JSONOUT) console.log(JSON.stringify(result))
   else console.log(`DM_HIT mid=${OWNER} name=${OWNER_NAME} ts=${r.ts} text=${r.text.replace(/\n/g, ' ').slice(0, 200)}`)
   process.exit(0)
 }
 // 没命中：把 lastSeen 往前推（避免旧消息反复触发；但只在对方是主人时推）
-if (r.ts > lastSeen) saveState({ lastSeen: r.ts, at: new Date().toISOString() })
+if (r.ts > lastSeen) saveState({ owner: OWNER, lastSeen: r.ts, lastKey: r.key, at: new Date().toISOString() })
 if (JSONOUT) console.log(JSON.stringify({ hit: false }))
 else if (!ONCE) console.log('无新私信')
 process.exit(1)

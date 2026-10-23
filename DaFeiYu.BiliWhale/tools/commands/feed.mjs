@@ -1,8 +1,8 @@
 // 选题器：照"她自己的偏好"挑今天该看什么。**只读**，不产生任何对外动作。
 //
 // 用法: node feed.mjs [--n 6] [--per 2] [--pool 30]
-// 数据来源：~/.dsh/whale-diary.md 的「爱看」一行（偏好关键词）+「看过的」表格（防重复）
-//          + commented-videos.md（已评论过的视频也排除）
+// 数据来源：两本日记（她写下的 BV + 「爱看」偏好关键词）+ 真账本 quota.json 的 log[]
+//          + whale-log.jsonl 事件流（已看过/已评论过的视频全部排除；见下方「已看过/已评论过」注释块）
 //
 // 为什么这么做（2026-10-14 主人定的方向）：主人要的是"有日子的鱼"，
 // 所以"看什么"不该由别人喂，而该由她自己的偏好决定 —— 偏好写在日记里，这个脚本只负责照它去捞。
@@ -10,35 +10,90 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { config } from '../lib/config.mjs'
 import crypto from 'node:crypto'
+import { dshPath } from '../lib/paths.mjs'
+
 
 const argv = process.argv.slice(2)
 const opt = {}
 for (let i = 0; i < argv.length; i += 1) {
-  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i]
+  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i] ?? true
 }
 const N = Number(opt.n ?? 6)
 const PER = Number(opt.per ?? 2)
 const POOL = Number(opt.pool ?? 30)
 
 const HOME = (process.env.USERPROFILE || process.env.HOME || '/')
-const diary = path.join(HOME, '.dsh', 'whale-diary.md')
+// 日记（给主人的那本）：Alife 移植把日记搬成纯文本 txt，并给子进程传 WHALE_DIARY_FILE
+// （diary.mjs 就是这个顺序）→ 这里跟它对齐，别再只认老 .md 路径 ✗
+const diary = process.env.WHALE_DIARY_FILE || dshPath('whale-diary.md')
+// 她自己的那本（不加滤镜）：里面写着"这条看了、几分" —— "已看过"最直接的证据
+const privateDiary = process.env.WHALE_DIARY_PRIVATE_FILE || dshPath('whale-diary-private.md')
 // 2026-10-18：审计表挪到 `~/.bili-ai/` ✓（原来写死作者机器路径 ✗ 换机器就写不进去，静默失效 ✗）
 const audit = path.join(HOME, '.bili-ai', 'commented-videos.md')
+// ★ 真账本（2026-10-22 修「选题池回声」，见下）
+const quotaFile = path.join(HOME, '.bili-ai', 'quota.json')
+const eventLog = dshPath('whale-log.jsonl')
 
-// ── 偏好与"看过"名单：都从日记里读 ──
+// ── 偏好 ──
 let prefs = [...(config().preferences?.like ?? [])]   // 偏好来自统一配置（首选）
 let dislike = [...(config().preferences?.dislike ?? [])]
-let seen = new Set()
+
+// ── 已看过 / 已评论过（选题去重的唯一依据）──────────────────────────────────
+// 2026-10-22 根因（她自己报过「选题池还是回声，六条里五条看过的」）：
+//   v0.4.5 只从两处收 BV：① 日记里出现的 BV  ② `<HOME>/.bili-ai/commented-videos.md`。
+//   ② **全仓库没有任何写者**（只有这里读它），文件从来不存在 → 那一路恒为空；
+//   ① 又被"日记搬家"（.md → 纯文本 txt / WHALE_DIARY_FILE）绕过去了。
+//   两处一起失效 → seen 恒空 → 看过的视频又被推荐回来 ✗
+// 现在改成读**真账本**（都只有"真发出/真做过"才写进去）：
+//   · quota.json 的 log[]：comment / fav / dm 在**成功之后**才 record；每条有 at / type / target
+//   · whale-log.jsonl：她自己的事件流（fav / share / reply）—— 追加写，最容易被写坏一半
+//   · 两本日记：她写下的 BV
+// 上游 2.0.1 踩过的三个坑，这里都按它避：
+//   ① 日期可能带时间 → 逐条/逐行解析，**一条坏只丢那一条**，绝不整份放弃
+//   ② 不假设 BV 号在第几列 → 只对 target/bv 串整体做 BV 正则（不 split、不取下标）
+//   ③ 「已发出」不看状态文字 → 只认账本里已经落地的记录
+const BV_RE = /\bBV[0-9A-Za-z]{10}\b/g
+const harvest = (text, out) => { for (const m of String(text ?? '').matchAll(BV_RE)) out.add(m[0]) }
+const harvestFields = (obj, out) => { harvest(obj?.target, out); harvest(obj?.bv, out) }
+
+const seenDiary = new Set()
+for (const f of [...new Set([diary, privateDiary].filter(Boolean))]) {
+  try {
+    const text = fs.readFileSync(f, 'utf8')
+    harvest(text, seenDiary)
+    const m = text.match(/^-\s*\*\*爱看\*\*：(.+)$/m)
+    // 兼容旧写法：日记里若仍写着「爱看」，只在配置没给偏好时兜底（日记应回归纯叙事）
+    if (m && !prefs.length) prefs = m[1].split(/[·、,，]/).map((s) => s.trim()).filter(Boolean)
+  } catch { /* 这本没有就算了 */ }
+}
+
+// ② quota.json：优先逐条读 target/bv；整份解不开就退回全文正则 —— 不能静默失效
+const seenQuota = new Set()
 try {
-  const text = fs.readFileSync(diary, 'utf8')
-  const m = text.match(/^-\s*\*\*爱看\*\*：(.+)$/m)
-  // 兼容旧写法：日记里若仍写着「爱看」，只在配置没给偏好时兜底（日记应回归纯叙事）
-  if (m && !prefs.length) prefs = m[1].split(/[·、,，]/).map((s) => s.trim()).filter(Boolean)
-  for (const bv of text.matchAll(/\bBV[0-9A-Za-z]{10}\b/g)) seen.add(bv[0])
-} catch { console.log('（读不到日记，用默认偏好）') }
+  const raw = fs.readFileSync(quotaFile, 'utf8')
+  let parsed = false
+  try {
+    const q = JSON.parse(raw)
+    if (Array.isArray(q?.log)) { for (const e of q.log) harvestFields(e, seenQuota); parsed = true }
+  } catch { /* 账本半截/坏了 */ }
+  if (!parsed) harvest(raw, seenQuota)
+} catch { /* 还没有账本 */ }
+
+// ③ whale-log.jsonl：逐行解析，坏行只丢那一行（这个文件是追加写的，最容易留半行）
+const seenLog = new Set()
 try {
-  for (const bv of fs.readFileSync(audit, 'utf8').matchAll(/\bBV[0-9A-Za-z]{10}\b/g)) seen.add(bv[0])
-} catch { /* 没有审计表也无妨 */ }
+  for (const line of fs.readFileSync(eventLog, 'utf8').split(/\r?\n/)) {
+    if (!line.trim()) continue
+    try { harvestFields(JSON.parse(line), seenLog) } catch { harvest(line, seenLog) }
+  }
+} catch { /* 还没有事件流 */ }
+
+// ④ 上游原设计的审计表：将来若真有写者补上它，照旧生效（保留兼容，不再当唯一来源）
+const seenAudit = new Set()
+try { harvest(fs.readFileSync(audit, 'utf8'), seenAudit) } catch { /* 没有也无妨 */ }
+
+const seen = new Set([...seenDiary, ...seenQuota, ...seenLog, ...seenAudit])
+if (seenDiary.size === 0 && seenQuota.size === 0 && seenLog.size === 0) console.log('（读不到日记与账本，用默认偏好）')
 
 const cred = JSON.parse(fs.readFileSync(path.join(HOME, '.bili-ai', 'credentials.json'), 'utf8'))
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -195,7 +250,7 @@ for (const x of uniq) {
 
 console.log(`偏好（来自日记）: ${prefs.join(' · ')}`)
 console.log(`反馈回流: 被赞 ${likedEvents.length} 条 · 她收藏 ${favItems.length} 条 → 学会 ${learnedTokens.length} 个主题词`)
-console.log(`已看过/已评论过（已排除）: ${seen.size} 个 BV`)
+console.log(`已看过/已评论过（已排除）: ${seen.size} 个 BV（quota 账本 ${seenQuota.size} · 事件流 ${seenLog.size} · 日记 ${seenDiary.size}）`)
 console.log(`候选池: ${pool.length} 条 → 去重去已看后 ${uniq.length} 条\n`)
 console.log(`今天可以看这几条（每词最多 ${PER} 条，共 ${N} 条）：`)
 const perKw = {}

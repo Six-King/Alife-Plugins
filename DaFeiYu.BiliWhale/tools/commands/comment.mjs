@@ -12,9 +12,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from '../lib/capture.mjs'
 import { fileURLToPath } from 'node:url'
 import { config } from '../lib/config.mjs'
+import { validateShare } from '../lib/share-policy.mjs'
+import { NODE_EXE } from '../lib/nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
 
 // ── 限额闸（B 档「限额自主」的代码强制部分，2026-10-14 主人选 B 档）────────────────
 // 语义：闸门**只管自主发言**（带 --auto，即"她自己决定说的"）；主人当场授权的发言不拦 ✓
@@ -33,21 +35,29 @@ const REPLIED = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.
 const loadReplied = () => { try { return JSON.parse(fs.readFileSync(REPLIED, 'utf8')) } catch { return { byUid: {} } } }
 const saveReplied = (o) => { try { fs.mkdirSync(path.dirname(REPLIED), { recursive: true }); fs.writeFileSync(REPLIED, JSON.stringify(o, null, 2) + '\n') } catch {} }
 // 查出"被回复的那个人"是谁（reply/reply 里 rpid === parent 的那条的作者）
-async function parentAuthor(aid, rootRpid, parentRpid) {
+async function parentAuthor(aid, rootRpid, parentRpid, replyType) {
   for (let pn = 1; pn <= 4; pn += 1) {
-    const j = await (await fetch(`https://api.bilibili.com/x/v2/reply/reply?type=1&oid=${aid}&root=${rootRpid}&pn=${pn}&ps=20`, {
+    const j = await (await fetch(`https://api.bilibili.com/x/v2/reply/reply?type=${replyType}&oid=${aid}&root=${rootRpid}&pn=${pn}&ps=20`, {
       headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.bilibili.com/' },
     })).json()
     const list = j.data?.replies ?? []
     const hit = list.find((r) => String(r.rpid) === String(parentRpid))
     if (hit) return { mid: String(hit.mid ?? hit.member?.mid ?? ''), name: hit.member?.uname ?? '' }
+    // 2026-10-22 修（她自己诊断的，很准）：
+    //   我们要回的可能是一个【顶层评论】—— 那时 root == parent，
+    //   它根本不在楼中楼列表 replies 里 → 永远查不到 → fail-closed ✗
+    //   但同一个响应里就带着 data.root（就是那条顶层评论本身）✓ 直接用它 ✓
+    const rt = j.data?.root
+    if (rt && String(rt.rpid) === String(parentRpid)) {
+      return { mid: String(rt.mid ?? rt.member?.mid ?? ''), name: rt.member?.uname ?? '' }
+    }
     if (!list.length) break
   }
   return null
 }
 const quota = (args) => {
   try {
-    return { code: 0, out: execFileSync(process.execPath,
+    return { code: 0, out: execFileSync(NODE_EXE,
       [path.join(path.dirname(fileURLToPath(import.meta.url)), 'quota.mjs'), ...args], { encoding: 'utf8' }).trim() }
   } catch (e) { return { code: e.status ?? 1, out: String(e.stdout ?? e.message).trim() } }
 }
@@ -60,8 +70,16 @@ for (let i = 2; i < process.argv.length; i += 1) {
 const oid = args.get('oid')
 const bvid = args.get('bvid')
 let message = args.get('message')
-const root = args.get('root')     // 线程根评论 rpid（二级回复用）
-const parent = args.get('parent') // 要回复的那条评论 rpid
+let root = args.get('root')     // 线程根评论 rpid（二级回复用）
+let parent = args.get('parent') // 要回复的那条评论 rpid
+
+// 2026-10-22 修（她连着三次撞上）：
+//   B站 收件箱里【顶层评论】的 root_id 是 0 ✗
+//   而 x/v2/reply/reply?root=0 什么都查不到 → parentAuthor 返回 null
+//   → once-per-person 的 fail-closed 把回复挡死 ✗（她报「没查到被回复者的 uid」）
+//   root=0 的真实含义就是「parent 自己就是顶层评论」✓ 所以这里兜一下 ✓
+if (parent && (!root || String(root) === '0')) root = String(parent)
+
 // type=1 视频（默认）；type=11 动态/图文。⚠️ 动态的 oid 必须用
 // polymer/web-dynamic/v1/detail 给的 basic.comment_id_str，**不是** dyn_id 本身
 // （拿 dyn_id 当 oid 一律 -404，2026-10-13 实测踩过）。
@@ -71,8 +89,45 @@ const refererArg = args.get('referer') ? String(args.get('referer')) : ''
 const dry = args.get('dry') === true || args.has('dry')
 const go = args.get('go') === true || args.has('go')
 
+// 2026-10-22：--check 只读预检 —— 回答「这条回复到底能不能发」✗ 不发文、不占额度
+//   动机：她撞过几次 fail-closed 之后就开始凭记忆说「又被拒了」✗
+//        给她一条零副作用的检查命令 ✓ 让她自己看到「现在是通的」✓
+const CHECK = args.get('check') === true || args.has('check')
+if (CHECK) {
+  if (!oid) { console.error('--check 需要 --oid'); process.exit(2) }
+  const who = (root && parent) ? await parentAuthor(oid, root, parent, type) : null
+  const ownerMid = String(config().owner?.mid ?? '')
+  const lines = [
+    `oid=${oid}  root=${root ?? '(未给)'}  parent=${parent ?? '(未给)'}  type=${type}`,
+  ]
+  if (!root || !parent) {
+    lines.push('\n这是【顶层评论】（不带 --root/--parent）→ 判重不生效，可以直接发 ✓')
+    console.log(lines.join('\n')); process.exit(0)
+  }
+  if (!who?.mid) {
+    lines.push('\n✗ 查不到被回复者的 uid → 发的时候会被 fail-closed 挡下来 ✗')
+    lines.push('  查不到的原因通常是：--root 传了 0 / --parent 不是楼中楼也不是顶层评论 / 该评论已删')
+    lines.push('  修：root 传 0 或空时本命令会自动把它兜成 parent ✓ 再试一次')
+    console.log(lines.join('\n')); process.exit(2)
+  }
+  lines.push(`\n被回复者：${who.name || '(无名)'}（mid ${who.mid}）`)
+  if (ownerMid && String(who.mid) === ownerMid) {
+    lines.push('✓ 是主人 → 「同一个人只回一条」不适用 ✓ 能发 ✓')
+    console.log(lines.join('\n')); process.exit(0)
+  }
+  const led = loadReplied()
+  const hist = (led.byUid?.[who.mid] ?? []).filter((x) => Date.now() - new Date(x.at).getTime() < ONCE_DAYS * 86_400_000)
+  if (hist.length) {
+    lines.push(`✗ ${ONCE_DAYS} 天内已经回过 TA（${hist[0].at} · ${hist[0].target}）→ 带 --once-per-person 会被拒 ✗`)
+    lines.push('  （是主人就不受这条限制 ✓；否则换个人或等过了 30 天）')
+    console.log(lines.join('\n')); process.exit(2)
+  }
+  lines.push('✓ 30 天内没回过 TA → 能发 ✓')
+  console.log(lines.join('\n')); process.exit(0)
+}
+
 if (!oid || (!bvid && !refererArg) || !message) {
-  console.error('usage: --oid <aid|comment_id_str> [--bvid <BV...> | --referer <url>] --message "<text>" [--type 1|11] [--root <rpid> --parent <rpid>] [--dry | --go]')
+  console.error('usage: --oid <aid|comment_id_str> [--bvid <BV...> | --referer <url>] --message "<text>" [--type 1|11] [--root <rpid> --parent <rpid>] [--dry | --go] [--check]')
   process.exit(2)
 }
 if (dry && go) { console.error('pick either --dry or --go, not both'); process.exit(2) }
@@ -93,23 +148,8 @@ if (SHARE) {
   if (!AUTO) { console.error('--share 必须与 --auto 同传（分享型也是"她自己决定说的"）'); process.exit(2) }
   const ow = config().owner ?? {}
   if (!ow.name) { console.error('--share 需要先配置 owner.name（要 @ 谁）'); process.exit(2) }
-  // ── 「标尺」（2026-10-18 加，Kimi 提议 + 主人认可）────────────────────
-  // 把"值不值"从感觉变成可审计的流程：
-  //   ① --reason  必填（白纸黑字写"为什么值得占用主人一次注意力"）
-  //   ② --score   必填且 ≥ config.share.minScore（默认 13 = 超过 12 分）
-  //   ③ --rank    只能是 1（当天深读里的第一名 —— 相对比较比绝对打分稳）
-  // 三项任一不过 → 拒绝发送；"今天没有值得发的"本身就是合法结果 ✓
-  {
-    const reason = String(args.get('reason') ?? '').trim()
-    if (reason.length < 8) { console.error('--share 必须带 --reason "为什么值得占用主人一次注意力"（≥8 字）'); process.exit(2) }
-    const minScore = Number(config().share?.minScore ?? 7)
-    const score = Number(args.get('score'))
-    if (!Number.isFinite(score) || String(args.get('score') ?? '') === '') { console.error(`--share 必须带 --score（每项 0-4，满 20；阈值 ${minScore}，超过 12 就发）`); process.exit(2) }
-    if (score < minScore) { console.error(`✗ 评分 ${score} < 阈值 ${minScore} → 这条不值得发（"今天没有值得发的"是合法结果）`); process.exit(2) }
-    const rank = Number(args.get('rank') ?? 1)
-    if (rank !== 1) { console.error('--share 只允许 --rank 1（当天深读里的第一名）'); process.exit(2) }
-    console.log(`[标尺] 分数 ${score}/20（阈值 ${minScore}：超过 12 就发）· 排名 #${rank} · 理由：${reason.slice(0, 60)}`)
-  }
+  try { validateShare(config(), { reason: args.get('reason'), score: args.get('score'), rank: args.get('rank') ?? 1 }) }
+  catch (e) { console.error(e.message); process.exit(2) }
 
   const want = `@${ow.name}`
   const body = String(message ?? '').trimStart()
@@ -127,8 +167,29 @@ if (ONCE) {
   if (!parent || !root) {
     console.log('  [once] 没有 --root/--parent —— 这个开关只对"回复某人"生效，已忽略')
   } else {
-    const who = await parentAuthor(oid, root, parent)
-    if (!who?.mid) {
+    const who = await parentAuthor(oid, root, parent, type)
+    // 2026-10-22 临时诊断：把她实际传的参数 + 解析结果记下来（定位「同一命令我过她不过」）
+    try {
+      const fs2 = await import('node:fs')
+      const os2 = await import('node:os')
+      const p2 = await import('node:path')
+      const line = [
+        new Date().toISOString(),
+        'oid=' + oid,
+        'root=' + root,
+        'parent=' + parent,
+        'type=' + type,
+        '→ who=' + JSON.stringify(who),
+        'script=' + import.meta.url.split('/').slice(-2).join('/'),
+      ].join(' ') + '\n'
+      fs2.appendFileSync(p2.join(os2.homedir(), '.bili-ai', 'once-debug.log'), line)
+    } catch {}
+    // 2026-10-22 补回（这条在 v0.4.x 某次重写时丢了 ✗）：
+    //   这个开关是给【陌生人】防拉锯的 ✗ 对主人生效会把主人锁 30 天 ✗
+    const ownerMid = String(config().owner?.mid ?? '')
+    if (who?.mid && ownerMid && String(who.mid) === ownerMid) {
+      console.log(`  [once] 被回复的是主人（${who.name || who.mid}）→ 不适用「一个人只回一条」✓ 直接回`)
+    } else if (!who?.mid) {
       // fail-closed（2026-10-17，Kimi 评审指出）：判重系统状态未知时，默认动作是**这次不回**
       console.error('  [once] 没查到被回复者的 uid → 判重状态未知，**这次不回**（fail-closed）')
       console.error('  （确认要回就别传 --once-per-person，或者先手工确认这个人没被回过）')
@@ -153,10 +214,15 @@ if (!fs.existsSync(credPath)) {
   process.exit(3)
 }
 const cred = JSON.parse(fs.readFileSync(credPath, 'utf8'))
-const missing = ['sessdata', 'bili_jct', 'buvid3'].filter((k) => !cred[k] || String(cred[k]).trim() === '')
+// 2026-10-21 修：buvid3 不该是必填 ✗ —— 没有它的用户会被这里直接 exit 3，评论永远发不出去
+//   （B站 大部分写接口不需要 buvid3；缺了只影响个别接口）
+const missing = ['sessdata', 'bili_jct'].filter((k) => !cred[k] || String(cred[k]).trim() === '')
 if (missing.length) {
   console.error(`credentials file is missing values for: ${missing.join(', ')}`)
   process.exit(3)
+}
+if (!cred.buvid3 || String(cred.buvid3).trim() === '') {
+  console.error('⚠️ 没有 buvid3（不影响评论；个别接口可能被风控）—— 想补就在 F12 → Cookies 里复制 buvid3')
 }
 const cookieHeader = `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3}`
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -215,11 +281,6 @@ console.log('  cookie : SESSDATA=***; bili_jct=***; buvid3=***   (已脱敏)')
 console.log('  body   : ' + body.replace(encodeURIComponent(String(cred.bili_jct)), '***csrf***'))
 console.log(`  正文长度 ${message.length} 字符（上限 1000）；oid=${oid}；emoji/表情需转义符，本脚本只发纯文本`)
 
-if (dry) {
-  console.log('\n[dry] 未发送。确认文案与账号后，把 --dry 换成 --go 再跑一次。')
-  process.exit(0)
-}
-
 // 闸门：自主发言（--auto）或分享型（--share）才拦；主人授权的发言只显示额度
 {
   const target = bvid ? `BV:${bvid}` : `oid:${oid}`
@@ -229,6 +290,11 @@ if (dry) {
     console.error('  → 拒绝发送。这是硬约束第 4 条的代码实现，不要绕过（要发请主人当场授权，或改白名单/额度）。')
     process.exit(2)
   }
+}
+
+if (dry) {
+  console.log('\n[dry] 预检通过，未发送。把 --dry 换成 --go 时仍会重新检查额度。')
+  process.exit(0)
 }
 
 // 判重（--once-per-person）已在入口处检查，这里直接发
@@ -251,10 +317,15 @@ if (out.code === 0) {
   const rpid = out.data?.rpid_str ?? out.data?.rpid
   console.log(`  ✅ 已发布，评论 rpid=${rpid}`)
   // once-per-person：记一笔"回过谁"，下次判重用
+  // 2026-10-22：主人不进 replied.json —— 否则回他一条就把他锁 30 天 ✗
+  const __ownerMid = String(config().owner?.mid ?? '')
   if (ONCE && parent && root) {
     try {
-      const who = await parentAuthor(oid, root, parent)
-      if (who?.mid) {
+      const who = await parentAuthor(oid, root, parent, type)
+      // 2026-10-22：主人不进 replied.json（回他一条就把他锁 30 天 ✗）
+      const isOwnerRec = who?.mid && __ownerMid && String(who.mid) === __ownerMid
+      if (isOwnerRec) console.log('  [once] 被回复的是主人 → 不记账（下次还能回）✓')
+      if (who?.mid && !isOwnerRec) {
         const led = loadReplied()
         led.byUid ??= {}
         led.byUid[who.mid] ??= []
@@ -277,7 +348,7 @@ if (out.code === 0) {
   if (AUTO || SHARE) {
     try {
       const msg = `[${SHARE ? '分享型·@主人' : '自主发言'}] 评论已发出 rpid=${rpid}\n目标：${bvid ? 'BV:' + bvid : 'oid:' + oid}\n内容：${message.slice(0, 80)}`
-      execFileSync(process.execPath,
+      execFileSync(NODE_EXE,
         [path.join(path.dirname(fileURLToPath(import.meta.url)), 'notify.mjs'), msg, '--title', SHARE ? '分享评论报备' : '自主发言报备'],
         { stdio: 'inherit' })
     } catch (e) {

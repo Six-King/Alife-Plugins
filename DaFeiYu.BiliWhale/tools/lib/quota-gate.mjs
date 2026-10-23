@@ -3,15 +3,16 @@
 // 以前 quota.mjs 的头注释承诺「check 只挡发言类动作（comment / dynamic / danmaku）」，
 // 但 dynamic / dynamic-image / edit-dynamic / danmaku 四条写通道里 quota 出现 0 次 —— 等于裸奔。
 // 这里把「检查 + 记账」收成两个函数，四条通道各调一次。
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from './capture.mjs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { NODE_EXE } from './nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
 
 const QUOTA = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'quota.mjs')
 
 function run(args) {
   try {
-    return { code: 0, out: execFileSync(process.execPath, [QUOTA, ...args], { encoding: 'utf8' }).trim() }
+    return { code: 0, out: execFileSync(NODE_EXE, [QUOTA, ...args], { encoding: 'utf8' }).trim() }
   } catch (e) {
     return { code: e.status ?? 1, out: String(e.stdout ?? e.message).trim() }
   }

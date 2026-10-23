@@ -1,3 +1,4 @@
+import { apiGet } from '../lib/bili-api.mjs'
 // 让 agent 真"看"视频：取直链 → 下载 → ffmpeg 抽帧拼成一张九宫格 → 输出图片路径（再交给 read_image 看）
 //
 // 用法: node bili-watch.mjs <BV号> [列x行，默认 3x3] [outDir]
@@ -7,14 +8,16 @@
 // 依赖：ffmpeg（查找顺序见 lib/ffmpeg.mjs：$FFMPEG → PATH → bin/ → ~/.dsh/bili-whale/bin → 本机剪映）
 import fs from 'node:fs'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from '../lib/capture.mjs'
 import { requireFfmpeg } from '../lib/ffmpeg.mjs'
+import { dshPath } from '../lib/paths.mjs'
+
 
 let FFMPEG
 try { FFMPEG = requireFfmpeg() } catch (e) { console.error(String(e.message)); process.exit(2) }
 const bvid = process.argv[2]
 const grid = (process.argv[3] ?? '3x3').toLowerCase()
-const outDir = process.argv[4] ?? path.join((process.env.USERPROFILE || process.env.HOME || '/'), '.dsh', 'shots', 'video')
+const outDir = process.argv[4] ?? dshPath('shots', 'video')
 if (!bvid) { console.error('用法: node bili-watch.mjs <BV号> [列x行] [outDir]'); process.exit(2) }
 const [cols, rows] = grid.split('x').map(Number)
 if (!cols || !rows) { console.error('格子格式应是 3x3 这样'); process.exit(2) }
@@ -24,7 +27,7 @@ const cred = JSON.parse(fs.readFileSync(path.join((process.env.USERPROFILE || pr
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const H = { 'user-agent': UA, referer: 'https://www.bilibili.com/', cookie: `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3}` }
 
-const view = await (await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, { headers: H })).json()
+const view = await apiGet(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, H)
 if (view.code !== 0) { console.error(`view 失败 code=${view.code} ${view.message}`); process.exit(3) }
 const { cid, title, duration, owner } = { ...view.data, owner: view.data.owner?.name }
 console.log(`标题: ${title}`)
@@ -32,9 +35,9 @@ console.log(`UP: ${owner}   时长: ${duration}s   cid=${cid}`)
 
 // 画质实测（2026-10-14）：html5 + qn=32 会被压到 360p（返回 quality=16，界面小字全糊）；
 // 改 platform=pc + qn=80 可拿到 720p（返回 quality=64），依旧是普通 mp4 直链，不必碰 dash。
-const p = await (await fetch(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1&platform=pc&high_quality=1`, { headers: H })).json()
+const p = await apiGet(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1&platform=pc&high_quality=1`, H)
 const url = p.data?.durl?.[0]?.url
-if (!url) { console.error(`没拿到直链（code=${p.code}）——有些视频要登录或只有 dash 流`); process.exit(4) }
+if (!url) { console.error(`没拿到直链（code=${p.code} ${p.message ?? ""}）——有些视频要登录或只有 dash 流`); process.exit(4) }
 const QN = { 16: '360P', 32: '480P', 64: '720P', 80: '1080P' }
 console.log(`实际画质: ${QN[p.data.quality] ?? p.data.quality}`)
 
@@ -45,7 +48,12 @@ const sheet = path.join(outDir, `${bvid}-${stamp}-${cols}x${rows}.jpg`)
 
 const r = await fetch(url, { headers: { 'user-agent': UA, referer: 'https://www.bilibili.com/', range: 'bytes=0-' } })
 if (!r.ok) { console.error(`下载失败 HTTP ${r.status}`); process.exit(5) }
-fs.writeFileSync(mp4, Buffer.from(await r.arrayBuffer()))
+// 2026-10-21 修（外部审计 #6）：原来是 Buffer.from(await r.arrayBuffer()) ——
+//   一条两小时 720p 视频就是 1–2GB 内存峰值 ✗ 改成流式写盘，内存占用恒定 ✓
+if (!r.body) { console.error('下载失败：响应没有 body'); process.exit(5) }
+const { pipeline } = await import('node:stream/promises')
+const { Readable } = await import('node:stream')
+await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(mp4))
 console.log(`已下载: ${mp4}  (${(fs.statSync(mp4).size / 1024 / 1024).toFixed(2)} MB)`)
 
 // ── 取帧方式：优先"画面变化点"，不够再退回等间隔（2026-10-14 参考 K3 的做法）
@@ -55,7 +63,7 @@ function sceneTimes(file, th) {
   try {
     const out = execFileSync(FFMPEG, ['-hide_banner', '-i', file, '-vf',
       `select='gt(scene,${th})',metadata=print:file=-`, '-an', '-f', 'null', '-'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 })
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024, timeout: 600_000 })
     const ts = [...out.matchAll(/pts_time:([0-9.]+)/g)].map((m) => Number(m[1]))
     return [...new Set(ts)].filter((t) => t > 0.2)
   } catch { return [] }

@@ -17,7 +17,7 @@ const HOME = process.env.USERPROFILE || process.env.HOME || '/'
 const argv = process.argv.slice(2)
 const opt = {}
 for (let i = 0; i < argv.length; i += 1) {
-  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i]
+  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i] ?? true
 }
 const HOURS = Number(typeof opt.hours === 'string' ? opt.hours : 24)
 const ONLY_OWNER = process.argv.includes('--owner')

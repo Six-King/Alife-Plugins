@@ -13,10 +13,42 @@ C# 这一层是 Alife 适配层，实际干活的是内置的 Node 工具链（�
 
 **但它天生就是给 agent 改的**，维护成本可以完全丢给 AI：
 
-- 源码就是 `BiliWhale*.cs`（4 个文件）+ 一份纯 Node 的 `tools/`，**没有编译步骤、没有 npm 依赖**；
+- 源码就是 `BiliWhale*.cs`（**12 个文件**）+ 一份纯 Node 的 `tools/`，**没有编译步骤**；
+  唯一可选的 npm 依赖是「扫码登录」用到的 `qrcode`（`cd tools && npm i` 即可，用 Cookie 登录则完全不需要）；
 - 哪里不对，就把**整个插件目录**交给你的 AI agent，说清现象和期望，它改完调一次 `reload_plugin` 就生效；
 - 配置项改完**不需要重载**：约 3 秒自己生效（机制见 `ALIFE-PORT.md` 的「配置热更新」一节）；
 - 出报错时把「插件目录 + 出错日志（`PluginData\<插件id>\biliwhale.log`）」一起丢给 agent，比等人快得多。
+
+---
+
+## 本次更新（5.0.0）
+
+- **版本号对齐客户端主版本**（客户端 5.0.0 → 插件 5.0.0），并用 5.0.0 的插件编译环境验证：0 error、依赖齐全。
+- **依赖清单补齐**：新增 `Alife.Function.QChat`（QQ 通知那一路要用）与 `Alife.Function.AIModelUtility`
+  （深读听声音那一路要用）—— 之前没声明，别人装的时候可能因为缺依赖编译不过。
+- **源码从 4 个文件长到 12 个**（新增 `BiliWhaleApi` / `Deep` / `Image` / `Login` / `Ops` / `Prompts` / `Tools` / `UI`），
+  Runner 与 Clock 也大幅扩充；工具链新增**扫码登录**（`qr-login`）、**自检**（`diagnose`/`selftest`）、
+  **检查更新**（`check-update`）、评论区与私信的一批新命令，`whale-night` 的排程逻辑拆进 `lib/night-plan.mjs`。
+
+## 与大肥鱼梗图库的联动
+
+两个插件是**一对**：**大肥鱼梗图库**（`DaFeiYu.MemePack`）是图源，**B站养鱼**负责在 B站 上干活时把图用出去。
+
+- **一步拿图**：`<MemeFetch keyword="委屈"/>` 会把梗图下载到本地并返回路径，直接填进评论/动态的配图参数就行。
+- **裸编号也行**：`image="002"` 会去大肥鱼梗图库的缓存目录
+  （`Storage\PluginData\DaFeiYu.MemePack\cache`）里找那张，省一次调用。
+- **开关**：配置里「评论可以带图」（`BiliCommentImage`）开了才允许把本地图随评论发出去，关掉这个函数直接拒绝。
+- **装法**：想用带图就两个都装（市场里搜「大肥鱼」）；只装 B站养鱼也能跑，只是没有梗图配图。
+
+## 5.0 适配说明
+
+- **版本号**：官方清单要求插件主版本不低于客户端（客户端 5.0.0 → 插件 5.0.0）。
+- **编译验证**：在 5.0.0 客户端 + `Alife.Function.FunctionCaller` / `AIModelUtility` 5.0.0 环境下编译，0 error。
+- **用到的 5.0 接口**：`XmlFunction` / `FunctionMode`、`XmlFunctionCaller.RegisterHandler(handler, DocumentMode, CancellationToken)`、
+  `AlifePath` / `AlifeContext`、`IConfigurable<T>` 配置热生效（约 3 秒）。
+- **存储不变**：数据都在 `Storage\PluginData\DaFeiYu.BiliWhale\`，升级插件不会丢日记、账本、闸门状态。
+- **QQ 通知**：走提示词里的 `<QChat type="Private" targetid="…">`，需要官方 QChat 插件（已在依赖里声明）；
+  不想用 QQ 就把通知方式改成「只写日志」。
 
 ---
 

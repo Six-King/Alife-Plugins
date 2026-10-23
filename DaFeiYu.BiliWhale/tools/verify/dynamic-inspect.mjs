@@ -15,7 +15,7 @@ const url = `https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?${q}&w_rid
 const d = await (await fetch(url, { headers: { 'user-agent': UA, referer: `https://t.bilibili.com/${dynId}` } })).json()
 console.log(`detail code=${d.code} ${d.message ?? ''}`)
 const it = d.data?.item
-if (!it) process.exit(0)
+if (!it) { console.error('✗ 拿不到这条动态（可能不存在 / 被删 / 需要登录）'); process.exit(4) }
 console.log(`id=${it.id_str}  类型=${it.type}  作者=${it.modules?.module_author?.name} (mid ${it.modules?.module_author?.mid})`)
 console.log(`发布时间=${it.modules?.module_author?.pub_time}`)
 const dyn = it.modules?.module_dynamic ?? {}

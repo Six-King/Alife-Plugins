@@ -13,12 +13,14 @@
 //
 // 配置（~/.dsh/bili-whale.config.json 的 notify 段）：
 //   { "type": "none|desktop|webhook|command", "url": "", "template": "text|markdown", "cmd": "" }
-import { execFileSync, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
+import { execFileSync } from '../lib/capture.mjs'
 import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { config } from '../lib/config.mjs'
+import { NODE_EXE } from '../lib/nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
 
 const argv = process.argv.slice(2)
 const DRY = argv.includes('--dry')
@@ -82,7 +84,7 @@ function sendDesktop() {
   const ps = [
     '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
     '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null',
-    '"<toast><visual><binding template=\\"ToastGeneric\\"><text></text><text></text></binding></visual></toast>" | Out-File -Encoding utf8 $env:DW_XML',
+    '"<toast><visual><binding template=""ToastGeneric""><text></text><text></text></binding></visual></toast>" | Out-File -Encoding utf8 $env:DW_XML',
     '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
     '$xml.LoadXml([IO.File]::ReadAllText($env:DW_XML))',
     '$node = $xml.GetElementsByTagName("text")',
@@ -94,11 +96,13 @@ function sendDesktop() {
   const script = path.join(os.tmpdir(), `dw-toast-${Date.now()}.ps1`)
   const xml = path.join(os.tmpdir(), `dw-toast-${Date.now()}.xml`)
   fs.writeFileSync(script, ps, 'utf8')
-  execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script], {
+  try { execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script], {
     env: { ...process.env, DW_TITLE: String(title), DW_TEXT: String(text), DW_XML: xml },
-    stdio: 'ignore', timeout: 15000,
+    encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'],
   })
-  fs.rmSync(script, { force: true })
+  } finally {
+    fs.rmSync(script, { force: true }); fs.rmSync(xml, { force: true })
+  }
   console.log('桌面通知已发送 ✓')
 }
 
@@ -154,15 +158,33 @@ try {
     }
   } else if (type === 'dm') {
     // 2026-10-19 加：B站私信（专属通道）—— 调 commands/dm.mjs 的发送逻辑
-    //   私信自带三道闸（只发主人 / 必须互关 / 一天只锁定一个收信人）；失败只提示，不抛 ✗
+    //   私信自带三道闸（只发主人 / 必须互相关注 / 一天只锁定一个收信人）；失败只提示，不抛 ✗
+    // 2026-10-19：DSH 的 Windows 沙箱禁止捕获子进程输出（管道 → EPERM）——
+    //   用文件句柄重定向拿输出（不走管道），再原样转贴到 stdout/stderr。
+    // 2026-10-21 修（审查 P1-1）：原来这里写死 --go，且没有 DRY 判断 ✗
+    //   → notify "…" --dry 在 type=dm 时会【真的发出私信】✗
+    // 注意：这里在模块顶层，不能用 return ✗ → 用 exit(0)（预演到此为止 ✓）
+    if (DRY) { console.log('[dry] B站私信（不发送）：' + String(text).slice(0, 80)); process.exit(0) }
     const dmPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dm.mjs')
-    const r = spawnSync(process.execPath, [dmPath, '--msg', String(text), '--go'], { encoding: 'utf8', timeout: 90000 })
-    process.stdout.write(String(r.stdout ?? ''))
-    if (r.status !== 0) console.error(String(r.stderr ?? '').trim() || '（私信发送失败）')
+    const outF = path.join(os.tmpdir(), `whale-dm-out-${process.pid}-${Date.now()}.txt`)
+    const errF = path.join(os.tmpdir(), `whale-dm-err-${process.pid}-${Date.now()}.txt`)
+    const fdO = fs.openSync(outF, 'w'); const fdE = fs.openSync(errF, 'w')
+    let r
+    try {
+      r = spawnSync(NODE_EXE, [dmPath, '--msg', String(text), '--go'], { stdio: ['ignore', fdO, fdE], timeout: 90000 })
+    } finally {
+      try { fs.closeSync(fdO) } catch {}
+      try { fs.closeSync(fdE) } catch {}
+    }
+    if (fs.existsSync(outF)) process.stdout.write(fs.readFileSync(outF, 'utf8'))
+    if (r?.status !== 0) console.error((fs.existsSync(errF) ? fs.readFileSync(errF, 'utf8') : '').trim() || '（私信发送失败）')
+    fs.rmSync(outF, { force: true }); fs.rmSync(errF, { force: true })
+    if (r?.error || r?.status !== 0) throw new Error('私信推送失败，未确认送达')
   } else if (type === 'stdout') {
     console.log(`[通知] ${title}\n${text}`)
   } else if (type === 'file') {
     const p = n.path ?? path.join(process.env.USERPROFILE || os.homedir(), '.dsh', 'whale-notify.log')
+    if (DRY) { console.log(`[dry] 通知文件：${p}（不写入）`); process.exit(0) }
     fs.mkdirSync(path.dirname(p), { recursive: true })
     fs.appendFileSync(p, JSON.stringify(payload) + '\n')
     console.log(`已写入通知文件：${p}`)

@@ -138,7 +138,12 @@ if (mode === 'send') {
   const hints = { 0: '成功', '-101': '账号未登录', '-111': 'csrf 校验失败', '-400': '请求错误/缺参数', 1003212: '超出长度限制', 10031: '发送频率过快' }
   console.log(`  HTTP ${out.status}  code=${b.code} ${b.message ?? b.msg ?? ''}`)
   console.log(`  ${hints[b.code] ?? ''}`)
-  if (b.code !== 0) console.log(`  原始: ${JSON.stringify(b).slice(0, 300)}`)
+  if (b.code !== 0) {
+    console.log(`  原始: ${JSON.stringify(b).slice(0, 300)}`)
+    // 2026-10-21 修（外部审计 #7）：发送失败必须非 0 退出 ——
+    //   否则 agent 拿到 exit 0 会当成"发出去了"，然后去 thread 复核才发现没有 ✗
+    process.exit(4)
+  }
   process.exit(0)
 }
 

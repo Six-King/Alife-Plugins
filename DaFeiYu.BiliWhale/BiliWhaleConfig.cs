@@ -44,6 +44,18 @@ public class BiliWhaleConfig
     [Description("B站设备指纹（可选，建议填）。不会回显")]
     public string Buvid3 { get; set; } = "";
 
+    [DisplayName("access_token（扫码登录自动写入）")]
+    [Description("点配置页「扫码登录」成功后由插件自动写入（有的返回里带、有的不带）。手填也不冲突；不会回显")]
+    public string AccessToken { get; set; } = "";
+
+    [DisplayName("扫码登录·二维码路径")]
+    [Description("点配置页「扫码登录」时那张二维码 PNG 存到哪。留空=桌面 bili-login-qr.png。扫完（或过期/超时）会自动删掉")]
+    public string QrImagePath { get; set; } = "";
+
+    [DisplayName("扫码登录·等待秒数")]
+    [Description("二维码最多等你扫多久，默认 150 秒。期间每 2 秒问一次；超时/过期就把图片删掉，可再点一次")]
+    public int QrLoginWaitSec { get; set; } = 150;
+
     [DisplayName("她自己 mid（只读）")]
     [Description("由 BiliSession 自动写入，用来认「谁回了我 / 谁点了赞」。留空即可")]
     public string SelfMid { get; set; } = "";
@@ -179,4 +191,82 @@ public class BiliWhaleConfig
     [DisplayName("私信监听")]
     [Description("开=每 20 秒看一次你的私信，有新消息才叫醒她（只认你，陌生人一律忽略）")]
     public bool ListenDm { get; set; } = false;
+
+    // ==================== @我 立刻通知 ====================
+    // 为什么单独一条腿：上游的 comment-await 是"回复我的 + @我的"合成一个进程、默认 5 分钟一轮、
+    // 而且受作息窗口限制 —— 被人 @ 了要等最多 5 分钟、夜里还可能等到第二天。
+    // @是"有人当面喊她"，所以这里自己拿 msgfeed/at 高频轮询（只读、零 token），命中立刻叫醒。
+
+    [DisplayName("@我 立刻通知")]
+    [Description("开=有个小进程高频盯「@我的」，有人 @ 她立刻叫醒她（没人 @ 就完全不花钱）。关=退回上游那个 5 分钟一轮的合成守夜")]
+    public bool ListenMention { get; set; } = true;
+
+    [DisplayName("@我 轮询间隔(秒)")]
+    [Description("多久看一次「@我的」。默认 45，最低 20；这是只读接口，但也别太频繁")]
+    public int MentionIntervalSec { get; set; } = 45;
+
+    [DisplayName("@我 全天盯")]
+    [Description("开=不管作息窗口，有人 @ 就立刻叫（推荐：@ 是有人当面喊她）；关=只在作息窗口里盯")]
+    public bool MentionAllDay { get; set; } = true;
+
+    [DisplayName("@我 启动补看(小时)")]
+    [Description("启动时往回补这么多小时里漏掉的 @（Alife 关着的时候也不漏）。默认 6，0=只看启动之后的新 @")]
+    public int MentionCatchUpHours { get; set; } = 6;
+
+    [DisplayName("@我 只认@她本人的")]
+    [Description("开=只叫醒「at_details 里确实有她 mid」的（推荐，最准）；关=只要进了 @收件箱 就算")]
+    public bool MentionOnlySelf { get; set; } = true;
+
+    // ==================== 深读：真正看懂一条视频 ====================
+    // 上游 debrief 把字幕写进文件却不打印、标签/分P/章节根本不取、抽帧只是 9 格拼图且从不送给视觉模型。
+    // 所以"看懂"这条腿由插件补齐：完整字幕 + 标签/分P/章节 + 关键帧逐帧喂视觉模型。
+
+    [DisplayName("深读抽帧数")]
+    [Description("BiliDeepRead 抽几张关键帧交给视觉模型看画面。0=不看画面（便宜很多）。默认 8")]
+    public int DeepReadFrames { get; set; } = 8;
+
+    [DisplayName("深读自动看画面")]
+    [Description("开=插件自己把关键帧和封面送进视觉模型，把画面描述并进深读结果（不用她再手动调视觉工具）；关=只给图片路径")]
+    public bool DeepReadVision { get; set; } = true;
+
+    [DisplayName("深读每帧描述字数")]
+    [Description("单帧画面描述的字数上限（默认 220）。调大更细但更慢")]
+    public int DeepReadVisionTokens { get; set; } = 220;
+
+    [DisplayName("深读字幕上限(字符)")]
+    [Description("整篇字幕喂给她的字符上限，超出就取头+尾。默认 9000")]
+    public int DeepReadTranscriptChars { get; set; } = 9000;
+
+    [DisplayName("深读听声音(音轨转写)")]
+    [Description("开=用本机 SenseVoice 把视频音轨流式转写成带时间戳的台词（没字幕的视频也能听懂）。关=只听字幕。本地模型有开销，所以有秒数上限，且只在深读时按需跑")]
+    public bool DeepReadAudio { get; set; } = true;
+
+    [DisplayName("深读听多久(秒)")]
+    [Description("音轨最多转写多少秒。默认 360（6 分钟），按 20 秒一段流式喂给识别器、每段用完即删，不把视频读进内存。0=不限（不建议）")]
+    public int DeepReadAudioSeconds { get; set; } = 360;
+
+    // ==================== 评论配图（梗图）与官方表情 ====================
+    // 官方表情：评论正文里直接写转义符 [tv_doge] 就行（B站服务端自己解析）。
+    // 梗图：B站评论支持 pictures，但要先把本地图上传到 B站图床换一个 img_src。
+
+    [DisplayName("允许评论配图")]
+    [Description("开=可以用 BiliCommentImage 把本地图片（含大肥鱼梗图库 MemeFetch 下来的梗图）随评论发出去。关=这个函数直接拒绝")]
+    public bool AllowImageComment { get; set; } = true;
+
+    [DisplayName("配图自动转码")]
+    [Description("梗图多是 webp，B站图床只收 png/jpg/gif；开=用 ffmpeg 自动转 jpg 再传。关=只接受本来就合规的图片")]
+    public bool ConvertImageForUpload { get; set; } = true;
+
+    // ==================== ⑰-5 每轮工具点名（默认不改行为） ====================
+    // 只影响"注入给她的常驻提示里多不多一段场景点名"，**绝不从工具注册表里摘任何工具**：
+    // 摘了会挡她自助（她本来能自己绕路解决的事会变成做不到）。
+    // full（默认）= 一个字都不加，与以前完全一致 ✓
+
+    [DisplayName("工具暴露模式")]
+    [Description("full=现状（不加任何东西，全凭她自己挑工具）；scened=在常驻提示里按场景点名「优先用哪几个」。注意：scened 也**不会摘掉任何工具**，只是多一段提示")]
+    public string ToolExposureMode { get; set; } = "full";
+
+    [DisplayName("场景点名表（只在 scened 模式生效）")]
+    [Description("每行一条：场景=工具A,工具B。只在 scened 模式下追加进常驻提示；full 模式完全不出现。留空/乱填=退回内置那张表")]
+    public string SceneToolHints { get; set; } = SceneToolHintsTable.Default;
 }

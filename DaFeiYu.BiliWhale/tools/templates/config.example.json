@@ -35,8 +35,7 @@
   "share": {
     "enabled": true,
     "minScore": 13,
-    "silentAfterDays": 3,
-    "decayPerDay": 1
+    "silentAfterDays": 3
   },
   "listen": {
     "comment": true,

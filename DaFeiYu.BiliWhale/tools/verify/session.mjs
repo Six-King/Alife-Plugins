@@ -9,7 +9,8 @@ if (!fs.existsSync(credPath)) {
   process.exit(3)
 }
 const cred = JSON.parse(fs.readFileSync(credPath, 'utf8'))
-const missing = ['sessdata', 'bili_jct', 'buvid3'].filter((k) => !cred[k] || String(cred[k]).trim() === '')
+// 2026-10-21：buvid3 改为可选（缺了不该拦住任何事 ✗）
+const missing = ['sessdata', 'bili_jct'].filter((k) => !cred[k] || String(cred[k]).trim() === '')
 if (missing.length) {
   console.error(`凭据文件里这些项是空的: ${missing.join(', ')}`)
   process.exit(3)

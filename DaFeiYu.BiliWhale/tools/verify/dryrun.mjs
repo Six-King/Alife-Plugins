@@ -2,21 +2,21 @@
 //  1. BV -> aid via the public view API (oid for the comment area)
 //  2. video facts + comment-area state + top comments (to read the room)
 //  3. WBI signing material from the public nav endpoint (newer endpoints want it)
+import { apiGet } from '../lib/bili-api.mjs'
+
 const BVID = process.argv[2]
 const H = {
   'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   referer: `https://www.bilibili.com/video/${BVID}/`,
 }
-const get = async (url) => {
-  const r = await fetch(url, { headers: H })
-  const t = await r.text()
-  try { return JSON.parse(t) } catch { return { __raw: t.slice(0, 200) } }
-}
+// 2026-10-22 迁到 apiGet：拿到节流（≥300ms）+ 熔断（撞 412 就停）+ 结构化错误 ✓
+//   recon 查的是 view / x/v2/reply —— 都在 CACHEABLE 白名单里，因此还能吃缓存 ✓
+const get = async (url) => await apiGet(url, H)
 
 const view = await get(`https://api.bilibili.com/x/web-interface/view?bvid=${BVID}`)
 if (view.code !== 0) {
   console.log(`view API code=${view.code} message=${view.message}`)
-  process.exit(0)
+  process.exit(4)   // 2026-10-21 修（外部审计 #7）：接口失败不该 exit 0
 }
 const d = view.data
 console.log('=== 视频 ===')

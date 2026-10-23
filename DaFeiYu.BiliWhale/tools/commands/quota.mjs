@@ -1,3 +1,4 @@
+import { apiGet } from '../lib/bili-api.mjs'
 // 对外发言的「限额闸」—— B 档"限额自主"的代码强制部分（2026-10-14 主人选 B 档）。
 //
 // 为什么不靠自觉：主人明确要求"限频写进代码，不是写进你的自觉里"。
@@ -14,7 +15,9 @@
 // 约定：check 只挡"发言类"动作（comment / dynamic / danmaku）；读操作永远不受限。
 import fs from 'node:fs'
 import path from 'node:path'
+import { newReplies } from '../lib/feedback.mjs'
 import { config } from '../lib/config.mjs'
+import { NODE_EXE } from '../lib/nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
 
 const FILE = path.join((process.env.USERPROFILE || process.env.HOME || '/'), '.bili-ai', 'quota.json')
 // 额度与白名单优先来自统一配置（lib/config.mjs）；本文件自己的 quota.json 仍是运行账本
@@ -32,9 +35,106 @@ const load = () => {
   return { ...DEFAULTS, log: Array.isArray(raw.log) ? raw.log : [] }
 }
 const save = (q) => { fs.mkdirSync(path.dirname(FILE), { recursive: true }); fs.writeFileSync(FILE, JSON.stringify({ log: q.log ?? [] }, null, 2) + '\n') }
+
+// ── 账本按月归档（2026-10-23 加，任务⑰-4）──────────────────────────────
+// 为什么：quota.json 只增不减 —— 越久每次 check 解析越慢、"查账"越长。
+// 做法：把 **archiveAfterDays（默认 30）天前**的记录按 **类型+月份** 挪进 `Archive\<类型>-YYYY-MM.json`。
+//   ① **7 天判重 / 当日额度完全不受影响**：30 天前的行本就不可能落在 7 天窗口或"今天"里 ✓
+//   ② **不许丢行**：先规划（读旧档→按内容去重→逐条校验覆盖），**全部校验通过才落盘**；
+//      归档文件写后**回读校验**，最后才从当期删除 —— 任何一步失败都原样不动 ✓
+//   ③ **幂等**：挪走的行已从当期删除 → 再跑 moved=0；归档侧按内容 key 去重，重复跑不会重复写 ✓
+//   ④ **读时合并**：loadMerged() = 全部归档 + 当期（去重、按时间升序）✓ 归档**近期**历史照旧查得到
+const ARCHIVE_DIR = path.join(path.dirname(FILE), 'Archive')
+const archiveAfterDays = () => Number(config().quota?.archiveAfterDays ?? 30)
+const rowKey = (r) => [r?.at, r?.type, r?.target, r?.note, r?.share ? 'S' : '', r?.auto ? 'A' : ''].join('\u0001')
+const monthOf = (at) => dayOf(at).slice(0, 7)
+const safeType = (t) => String(t ?? 'unknown').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'unknown'
+
+/** 读全部归档（单个坏档跳过，不影响主流程）→ 行数组 */
+function loadArchives() {
+  const rows = []
+  try {
+    for (const f of fs.readdirSync(ARCHIVE_DIR)) {
+      if (!f.endsWith('.json')) continue
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, f), 'utf8'))
+        rows.push(...(Array.isArray(j) ? j : (Array.isArray(j?.log) ? j.log : [])))
+      } catch { /* 单个坏档不影响别的档 */ }
+    }
+  } catch { /* 目录不存在 = 还没归档过 */ }
+  return rows
+}
+
+/** 当期 + 归档合并（去重、按时间升序）—— 读侧用这个，别直接用 q.log ✓ */
+function loadMerged() {
+  const seen = new Set()
+  const out = []
+  for (const r of [...loadArchives(), ...q.log]) {
+    const k = rowKey(r)
+    if (seen.has(k)) continue
+    seen.add(k); out.push(r)
+  }
+  return out.sort((a, b) => Date.parse(a?.at ?? 0) - Date.parse(b?.at ?? 0))
+}
+
+/** 归档。返回 {moved, files:[{file,added,total}], total, kept, skipped?} */
+function archiveNow({ dry = false, days = archiveAfterDays() } = {}) {
+  const base = { days, dry, moved: 0, files: [], total: q.log.length, kept: q.log.length }
+  if (!(days > 0)) return { ...base, skipped: 'archiveAfterDays <= 0（归档已关闭）' }
+  const cutoff = Date.now() - days * 86_400_000
+  const old = q.log.filter((x) => { const t = Date.parse(x?.at ?? ''); return Number.isFinite(t) && t < cutoff })
+  if (old.length === 0) return base
+  const keep = q.log.filter((x) => !old.includes(x))
+
+  const byFile = new Map()
+  for (const r of old) {
+    const name = `${safeType(r.type)}-${monthOf(r.at)}.json`
+    if (!byFile.has(name)) byFile.set(name, [])
+    byFile.get(name).push(r)
+  }
+  const plans = []
+  for (const [name, rows] of byFile) {
+    const file = path.join(ARCHIVE_DIR, name)
+    let existing = []
+    let existingObj = null
+    if (fs.existsSync(file)) {
+      try {
+        const j = JSON.parse(fs.readFileSync(file, 'utf8'))
+        existingObj = Array.isArray(j) ? null : j
+        existing = Array.isArray(j) ? j : (Array.isArray(j?.log) ? j.log : [])
+      } catch { return { ...base, skipped: `归档文件损坏，未做任何改动：${name}` } }
+    }
+    const have = new Set(existing.map(rowKey))
+    const add = rows.filter((r) => !have.has(rowKey(r)))
+    if (add.length + (rows.length - add.length) !== rows.length) return { ...base, skipped: `行数校验失败，未做任何改动：${name}` }
+    plans.push({ file, name, rows, existing, existingObj, add })
+  }
+  if (dry) {
+    return { ...base, moved: old.length, kept: keep.length, planned: true, files: plans.map((p) => ({ file: p.name, added: p.add.length, total: p.existing.length + p.add.length })) }
+  }
+
+  fs.mkdirSync(ARCHIVE_DIR, { recursive: true })
+  for (const p of plans) {
+    const merged = [...p.existing, ...p.add].sort((a, b) => Date.parse(a?.at ?? 0) - Date.parse(b?.at ?? 0))
+    const meta = { type: safeType(p.rows[0]?.type), month: monthOf(p.rows[0]?.at), count: merged.length, updatedAt: new Date().toISOString() }
+    fs.writeFileSync(p.file, JSON.stringify({ ...(p.existingObj ?? {}), ...meta, log: merged }, null, 2) + '\n')
+    // 写后回读：长度不符 → 停手（当期一行都不删 ✓）
+    let back = null
+    try { const j = JSON.parse(fs.readFileSync(p.file, 'utf8')); back = Array.isArray(j) ? j : (j?.log ?? null) } catch { back = null }
+    if (!Array.isArray(back) || back.length !== merged.length) return { ...base, skipped: `归档回读校验失败，当期未改动：${p.name}` }
+    base.files.push({ file: p.name, added: p.add.length, total: merged.length })
+  }
+  // 全部档写成功 → 才从当期删除（行数守恒 ✓）
+  if (keep.length !== base.total - old.length) return { ...base, skipped: '当期行数守恒校验失败，未写回' }
+  q.log = keep
+  save(q)
+  const archiveRows = loadArchives().length
+  if (archiveRows < base.total - keep.length) return { ...base, moved: old.length, kept: keep.length, skipped: '归档总行数少于应归档数（异常，已保留当期删除前的副本于归档中）' }
+  return { ...base, moved: old.length, kept: keep.length, archiveRows }
+}
 // ── 沉默衰减（2026-10-18 加，主人定）────────────────────────────────
 // 反馈的定义：**任何表态都算**（回她的评论 / 点赞 / 在微信里说一句 / 让她做点事…）
-// 都没有 = 沉默。沉默 ≥ silentAfterDays(3) 天开始扣：每天 -decayPerDay(1)，
+// 都没有 = 沉默。沉默 ≥ silentAfterDays(3) 天开始降，到 silentStopDays(7) 降到 0
 // 扣到 0 就停止分享；**但两本日记照常写**（那是她的日子，不是发言）。
 const FEEDBACK = path.join((process.env.USERPROFILE || process.env.HOME || '.'), '.bili-ai', 'feedback.json')
 const loadFeedback = () => { try { return JSON.parse(fs.readFileSync(FEEDBACK, 'utf8')) } catch { return { last: null, events: [] } } }
@@ -46,10 +146,7 @@ async function titleOf(bv, cache) {
   if (!bv) return ''
   if (cache[bv]) return cache[bv]
   try {
-    const r = await fetch('https://api.bilibili.com/x/web-interface/view?bvid=' + bv, {
-      headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.bilibili.com/' },
-    })
-    const j = await r.json()
+    const j = await apiGet('https://api.bilibili.com/x/web-interface/view?bvid=' + bv, { 'user-agent': 'Mozilla/5.0', referer: 'https://www.bilibili.com/' })
     const t = String(j?.data?.title ?? '')
     if (t) cache[bv] = t
     return t
@@ -60,7 +157,7 @@ const saveFeedback = (f) => { fs.mkdirSync(path.dirname(FEEDBACK), { recursive: 
 /** 沉默天数：从来没反馈过就从"第一次分享"算；返回 { days, cap } */
 function silence() {
   const fb = loadFeedback()
-  const base = fb.last ?? (q.log.find((x) => x.share)?.at ?? null)   // 没反馈过 → 从第一次分享算
+  const base = fb.last ?? (loadMerged().find((x) => x.share)?.at ?? null)   // 没反馈过 → 从第一次分享算（含已归档的 ✓）
   const days = base ? Math.floor((Date.now() - new Date(base).getTime()) / 86_400_000) : 0
   const after = Number(config().share?.silentAfterDays ?? 3)     // 3 天开始衰减
   const stopAt = Math.max(after + 1, Number(config().share?.silentStopDays ?? 7))  // 7 天完全停
@@ -100,16 +197,31 @@ for (let i = 1; i < argv.length; i += 1) {
 }
 const q = load()
 
+// ── 归档命令（2026-10-23，任务⑰-4）：幂等；--dry 只看不动；--days N 临时改阈值 ──
+if (cmd === 'archive') {
+  const days = opt.days !== undefined ? Number(opt.days) : archiveAfterDays()
+  const r = archiveNow({ dry: !!opt.dry, days })
+  if (opt.json) console.log(JSON.stringify(r))
+  else if (r.skipped) console.log('未归档：' + r.skipped)
+  else if (r.moved === 0) console.log(`无需归档（阈值 ${r.days} 天；当期 ${r.total} 条都还新）`)
+  else console.log(`${r.dry ? '（dry-run）将' : '已'}归档 ${r.moved} 条 → ${r.files.map((f) => `${f.file}(+${f.added}，共 ${f.total})`).join(' / ')}；当期剩 ${r.kept} 条`)
+  process.exit(0)
+}
+
 if (cmd === 'status') {
+  const mergedLog = loadMerged()
+  const archivedCount = mergedLog.length - q.log.length
   const used = usedToday(q)
   const usedAuto = q.log.filter((x) => dayOf(x.at) === today() && x.auto && !x.share).length
   const usedShare = q.log.filter((x) => dayOf(x.at) === today() && x.share).length
   console.log(`今日对外发言: 共 ${used} 条（**分享型** ${usedShare}/${q.shareDaily ?? 3} · 自主发言不设条数上限 ✓ · 主人授权 ${used - usedAuto - usedShare} 条）   日期 ${today()}`)
+  console.log(`账本：当期 ${q.log.length} 条 · 归档 ${archivedCount} 条（Archive/）· 合并可查 ${mergedLog.length} 条 · 归档阈值 ${archiveAfterDays()} 天`)
   console.log(`缰绳：分享 ≤${q.shareDaily ?? 3}/天 · 评分卡 ≥${config().share?.minScore ?? 13}/20 · 同一视频 7 天一次 · 署名复核 · 事后报备`)
   console.log(`已删除（2026-10-18 主人定）：白名单 ✗ · 「自主 N 条」独立额度 ✗`)
-  const recent = q.log.slice(-5)
+  const recent = loadMerged().slice(-5)   // 当期 + 归档（任务⑰-4）—— 归档后仍看得到历史 ✓
   console.log(recent.length ? '最近记录:' : '最近记录: (无)')
-  for (const r of recent) console.log(`  ${r.at}  ${r.type}  ${r.target ?? '-'}  ${r.note ?? ''}`)
+  for (const r of recent) console.log(`  ${r.at}  ${r.type}  ${r.target ?? '-'}  ${String(r.note ?? '').slice(0, 24)}${String(r.note ?? '').length > 24 ? '…' : ''}`)
+  if (recent.length) console.log('  （以上只用于查账，别照抄它的句式或开场白）')
   process.exit(0)
 }
 
@@ -131,6 +243,7 @@ if (cmd === 'check') {
   // 它**不看白名单**（因为不是去跟陌生人互动，是给主人递东西），但三条硬限制：
   //   ① 每天合计 ≤ shareDaily（跨多次醒来共享）② 同一视频 7 天内只能一次 ③ 正文必须 @ 主人
   if (share) {
+    if (config().share?.enabled === false) { console.error("分享已关闭"); process.exit(2) }
     const sil = silence()
     const effCap = Math.min(shareDaily, sil.cap)
     if (sil.penalty > 0) console.log(`  [沉默衰减] ${sil.days} 天没有任何表态 → 分享上限 ${shareDaily} → ${effCap}${effCap === 0 ? '（已停止分享；日记照常）' : ''}`)
@@ -139,7 +252,7 @@ if (cmd === 'check') {
       process.exit(2)
     }
     if (target) {
-      const dup = q.log.find((x) => x.share && String(x.target ?? '') === target && Date.now() - new Date(x.at).getTime() < SEVEN)
+      const dup = loadMerged().find((x) => x.share && String(x.target ?? '') === target && Date.now() - new Date(x.at).getTime() < SEVEN)   // 当期+归档一起看（⑰-4）✓
       if (dup) {
         console.log(`✗ 这个视频 7 天内已经分享过了：${dup.at}（${dup.target}）`)
         process.exit(2)
@@ -164,6 +277,12 @@ if (cmd === 'record') {
   const type = typeof opt.type === 'string' ? opt.type : 'unknown'
   q.log.push({ at: new Date().toISOString(), type, auto: !!opt.auto || !!opt.share, share: !!opt.share, target: opt.target ?? null, note: opt.note ?? null })
   save(q)
+  // 顺手归档（⑰-4）：记账是写路径，就在这儿把 30 天前的行挪进 Archive/（幂等；失败只提示不影响记账 ✓ 走 stderr 不污染 stdout ✓）
+  try {
+    const arc = archiveNow()
+    if (arc.moved > 0) console.error(`（账本归档：${arc.moved} 条 → ${arc.files.map((f) => `${f.file}+${f.added}`).join(' / ')}；当期剩 ${arc.kept} 条）`)
+    else if (arc.skipped) console.error(`（账本归档跳过：${arc.skipped}）`)
+  } catch (e) { console.error('（账本归档异常，已忽略：' + String(e?.message ?? e) + '）') }
   const usedAuto = q.log.filter((x) => dayOf(x.at) === today() && x.auto && !x.share).length
   const usedShare = q.log.filter((x) => dayOf(x.at) === today() && x.share).length
   console.log(`已记账：${type}${opt.share ? '（分享型·@主人）' : opt.auto ? '（自主）' : '（主人授权）'}${opt.target ? ' → ' + opt.target : ''}   今日分享 ${usedShare}/${q.shareDaily ?? 3}（自主发言不设上限 ✓）`)
@@ -188,25 +307,32 @@ if (cmd === 'ask') {
 
 if (cmd === 'react' && opt.auto) {
   try {
-    const { execFileSync } = await import('node:child_process')
+    const { execFileSync } = await import('../lib/capture.mjs')
     const here = (f) => decodeURIComponent(new URL(f, import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1')
     const hours = String(opt.hours ?? 72)
     const found = []
     // ① 回复
     try {
-      const out = execFileSync(process.execPath, [here('./comment-digest.mjs'), '--hours', hours, '--pages', '1'], { encoding: 'utf8' })
+      // 2026-10-22 修（Issue #14）：以前拿人类可读文本做子串匹配 ✗
+      //   统计行/标签行里出现主人名也会命中 → 误记反馈 → 沉默衰减被清零 ✗
+      //   现在读 --json 的结构化结果，按 mid 精确比对 ✓
+      const out = execFileSync(NODE_EXE, [here('./comment-digest.mjs'), '--hours', hours, '--pages', '1', '--json'], { encoding: 'utf8' })
       const ownerName = String(config().owner?.name ?? '')
       const ownerMid = String(config().owner?.mid ?? '')
-      if ((ownerName && out.includes(ownerName)) || (ownerMid && out.includes(ownerMid))) {
+      // 从结构化结果里取「主人回了几条」✓
+      let digest = null
+      try { digest = JSON.parse(String(out).trim().split(/\r?\n/).pop() ?? '') } catch {}
+      const ownerReplyCount = Number(digest?.ownerReplies ?? 0)
+      if (ownerReplyCount > 0) {
         // 只把"和主人有关"的行拿去算哈希（内容变了才继续算新表态 ✓）
-        const lines = String(out).split(/\r?\n/).filter((l) => (ownerName && l.includes(ownerName)) || (ownerMid && l.includes(ownerMid)))
+        const lines = (digest?.ownerReplyItems ?? []).map((r) => `${r.time} [${r.kind}] ${r.who}：「${r.text}」`)
         const { createHash } = await import('node:crypto')
-        found.push({ kind: 'reply', label: '回复', hash: createHash('sha1').update(lines.join('\n')).digest('hex') })
+        found.push({ kind: 'reply', label: '回复', items: digest.ownerReplyItems, hash: createHash('sha1').update(lines.join('\n')).digest('hex') })
       }
     } catch { /* 收件箱失败不影响点赞这一路 */ }
     // ② 点赞（--json 里 ownerLiked 是确定数字，比抠文本稳）
     try {
-      const js = execFileSync(process.execPath, [here('./likes.mjs'), '--owner', '--json', '--hours', hours], { encoding: 'utf8' })
+      const js = execFileSync(NODE_EXE, [here('./likes.mjs'), '--owner', '--json', '--hours', hours], { encoding: 'utf8' })
       const o = JSON.parse(js)
       const ownerMid2 = String(config().owner?.mid ?? '')
       if (Number(o.ownerLiked ?? 0) > 0) {
@@ -234,12 +360,14 @@ if (cmd === 'react' && opt.auto) {
       const fb = loadFeedback()
       const nowIso = new Date().toISOString()
       let changed = false
+      let newest = Number.isFinite(Date.parse(fb.last)) ? Date.parse(fb.last) : 0
       fb.events = [...(fb.events ?? [])]
       for (const f of found) {
         if (f.kind === 'like') {
           const prev = Number(fb.lastLikeTime ?? 0)
           if (f.maxTime > prev) {
             fb.lastLikeTime = f.maxTime
+            newest = Math.max(newest, Math.min(Date.now(), f.maxTime * 1000))
             // 只有"这次新出现的"才记（比上次 maxTime 新的那些）✓
             const fresh = (f.liked ?? []).filter((x) => x.likeTime > prev)
             if (fresh.length) {
@@ -265,21 +393,26 @@ if (cmd === 'react' && opt.auto) {
             changed = true
           }
         } else if (f.kind === 'reply') {
-          const prev = String(fb.lastReplyHash ?? '')
-          if (f.hash !== prev) {
-            fb.lastReplyHash = f.hash
-            fb.events.push({ at: nowIso, note: 'auto: 检测到主人（回复）' })
+          const reply = newReplies(f.items, fb)
+          const migrated = !fb.lastReplyTime && fb.lastReplyHash === f.hash
+          fb.lastReplyHash = f.hash
+          fb.lastReplyTime = reply.time
+          fb.replyIds = reply.ids
+          if (reply.fresh.length && !migrated) {
+            newest = Math.max(newest, reply.time)
+            fb.events.push({ at: new Date(reply.time).toISOString(), note: 'auto: 检测到主人（回复）' })
             changed = true
           }
         }
       }
       fb.events = fb.events.slice(-200)
       if (changed) {
-        fb.last = nowIso
+        fb.last = new Date(newest).toISOString()
         saveFeedback(fb)
         const names = found.filter((f) => (f.kind === 'like' ? f.maxTime > Number(fb.lastLikeTime ?? 0) - 1 : true)).map((f) => f.label)
         console.log(`✓ 自动识别到主人的【新】表态（${names.join(' / ') || found.map((f) => f.label).join(' / ')}）→ 已记一次反馈（沉默清零）`)
       } else {
+        saveFeedback(fb) // Persist migrated IDs even without a new reaction.
         console.log('（近 ' + hours + ' 小时有主人的表态，但都是【已经记过的】→ 不重复记 ✓ 沉默继续累计）')
       }
     } else {
@@ -318,4 +451,5 @@ console.log('用法:')
 console.log('  node quota.mjs status')
 console.log('  node quota.mjs check --type comment [--target "BVxxx"]')
 console.log('  node quota.mjs record --type comment --target "BVxxx" [--note "…"]')
+console.log('  node quota.mjs archive [--dry] [--days N] [--json]   把 N 天前的记录按月归档进 Archive/（默认 30 天，幂等）')
 // （set / allow 已删除 ✓）

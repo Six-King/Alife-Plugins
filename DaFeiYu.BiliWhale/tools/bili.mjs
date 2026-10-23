@@ -4,6 +4,7 @@
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { NODE_EXE } from './lib/nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const map = {
@@ -21,9 +22,13 @@ const map = {
   subtitles: ['commands/subtitles.mjs', '拉官方字幕全文（WBI 签名，带时间戳）：<BV> [--lan ai-zh] [--print N] —— 看视频最省的一条腿'],
   'watch-video': ['commands/bili-watch.mjs', '真"看"视频：取直链 → 下载 → ffmpeg 抽帧拼九宫格 → 交给 read_image：<BV> [3x3|4x4] [--uniform]'],
   debrief: ['commands/debrief.mjs', '看懂一条视频（一条龙）：封面+简介+官方字幕+弹幕热区(对齐字幕)+热评+画面抽帧：<BV> [--bucket 30] [--top 5] [--grid 3x3] [--no-frames]'],
+  comments: ['commands/comments.mjs', '热评 / 最新评论（只读，匿名可读）：<BV> [--ps 20] [--pn 1] [--sort hot|time] [--json] —— 日报挑片只要"标题+热评"时用它，比 debrief 轻'],
   feed: ['commands/feed.mjs', '选题器（只读）：照日记里的「爱看」捞候选，排除看过的/已评论过的：<BV> [--n 6] [--per 2]'],
   quota: ['commands/quota.mjs', '限额闸（B 档「限额自主」的代码强制部分）：status / check --auto|--share / record / set --daily N / allow <范围>'],
   likes: ['commands/likes.mjs', '谁赞了她（「收到的赞」通知流，含点赞者 mid/昵称）：--hours 24 [--owner] [--json]'],
+  'diagnose': ['commands/diagnose.mjs', '诊断导出（⑰-7③）：环境/配置/状态文件/最近日志打成一页**脱敏**文本（默认只打 stdout，--out 才落 .txt，拒绝 .md）'],
+  'check-update': ['commands/check-update.mjs', '检查更新（⑰-7①·只读）：本地 manifest 版本 vs 插件市场里本插件的 releases，输出"已是最新/有新版本 + 版本号"；**绝不覆盖插件文件**，--download 只把包放备份区'],
+  'qr-login': ['commands/qr-login.mjs', '扫码登录（⑰-3）：先只读验登录态（在线就跳过，不生成图片）→ 生成二维码 PNG 到桌面 → 轮询扫码 → 写凭据并删图（凭据不回显）'],
   selftest: ['commands/selftest.mjs', '启动测试（装完先跑这个）：配置/凭据/登录态/目录/ffmpeg + 下一步两件事（未分组会话 · 完全权限）'],
   deps: ['commands/deps.mjs', '依赖体检（装完先跑它）：cookie / ffmpeg / Node / 数据目录；--json 给 agent 判断'],
   diary: ['commands/diary.mjs', '她的一天（可见性）：show 人读摘要 / log 记结构化事件 / tail 最近事件'],
@@ -35,7 +40,7 @@ const map = {
   // —— 写（会真的发出去；都必须显式 --dry 或 --go） ——
   'dm-await': ['commands/dm-await.mjs', '私信监听（只认主人；命中打印 DM_HIT）'],
   fav: ['commands/fav.mjs', '收藏（我想留着）：判据强制 · --list / --check / <BV> --reason … --dry|--go'],
-  dm: ['commands/dm.mjs', '私信（专属通道）：一天 1 条 · 只发主人 · 必须互关（都写死）'],
+  dm: ['commands/dm.mjs', '私信（专属通道）：一天只锁定 1 个收信人（对这个人数不限）· 只发主人 · 必须互关'],
   comment: ['commands/comment.mjs', '发一条视频评论；带 --root/--parent 就是二级回复'],
   'reply-draft': ['commands/reply-draft.mjs', '待审回复（B 档：发前审核）：add 进队列 / list / drop / take'],
   'comment-del': ['commands/comment-del.mjs', '删除自己发的一条评论（x/v2/reply/del，只能删自己的）'],
@@ -43,11 +48,8 @@ const map = {
   'dynamic-image': ['commands/dynamic-image.mjs', '发图文动态（上传图片 + 可带 @节点）'],
   'dynamic-edit': ['commands/edit-dynamic.mjs', '编辑已存在的动态（文字/图片都能改，id 不变、评论与点赞保留）：<dyn_id> <文本文件> [--go]'],
   danmaku: ['commands/danmaku.mjs', '直播间弹幕：pre 预检 / send 发送 / history 回读 / live 实时流'],
-  auto: ['commands/danmaku-auto.mjs', '直播间自动回复：进程内监听+判断+发送（不再依赖 agent 回合）'],
   await: ['commands/danmaku-await.mjs', '直播间"叫我起床"：出现该回的弹幕就退出，交给 agent 回（质量优先）'],
   // —— 排查 ——
-  'dyn-keywords': ['diagnostics/dyn-detail-keywords.mjs', '在动态详情响应里搜关键词（定位文本去哪了）'],
-  'dyn-page': ['diagnostics/dyn-page-keywords.mjs', '在动态页面 HTML 里搜关键词'],
 }
 
 const [cmd, ...rest] = process.argv.slice(2)
@@ -61,10 +63,17 @@ if (!cmd || cmd === 'help' || cmd === '-h' || cmd === '--help') {
   console.log('  · 一次一条。批量、定时、多房间铺量不是这套工具的用途')
   process.exit(cmd ? 0 : 2)
 }
+// 2026-10-21 修 Issue #5：这 9 个脚本只认位置参数（argv[2]/argv[3]/…），
+//   但 help 和 README 教的是 --key 形式 → 参数原样透传进去后，脚本拿到的是字符串 "--bvid"，
+//   拼出的 URL 变成 ?bvid=--bvid → B站回 -400，看起来特别像 WBI 失效 / cookie 过期（极易误判 ✗）
+//   这里做一层翻译：只在"给出的键正好是期望顺序的前缀"时才转位置参数；给不全就不动，
+//   让脚本原来的报错照旧暴露出来（不猜、不静默 ✗）
+import { translateNamed } from './lib/cli-args.mjs'
+
 const entry = map[cmd]
 if (!entry) {
   console.error(`未知命令: ${cmd}\n跑 "node bili.mjs help" 看清单。`)
   process.exit(2)
 }
-const r = spawnSync(process.execPath, [path.join(here, entry[0]), ...rest], { stdio: 'inherit' })
+const r = spawnSync(NODE_EXE, [path.join(here, entry[0]), ...translateNamed(cmd, rest)], { stdio: 'inherit' })
 process.exit(r.status ?? 1)

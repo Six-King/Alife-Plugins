@@ -20,7 +20,8 @@ async function fetchAll() {
   return { code: 0, data: { root, replies: all } }
 }
 const d = await fetchAll()
-if (d.code !== 0) { console.log(`code=${d.code} message=${d.message}`); process.exit(0) }
+// 2026-10-21 修（外部审计 #7）：接口失败还 exit 0 → agent 会误判成「查到了、只是空的」✗
+if (d.code !== 0) { console.log(`code=${d.code} message=${d.message}`); process.exit(4) }
 const root = d.data?.root
 console.log('=== 线程根（顶层评论） ===')
 console.log(`  ${root.member.uname} (mid ${root.member.mid})  rpid=${root.rpid}  rcount=${root.rcount}`)

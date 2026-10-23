@@ -1,3 +1,4 @@
+import { apiGet } from '../lib/bili-api.mjs'
 // 拉 B 站官方字幕（带时间戳）——"看视频"里最省的一条腿：先拿文字，再决定要不要抽帧看画面。
 //
 // 用法: node subtitles.mjs <BV> [--lan ai-zh] [--out 目录] [--print 12]
@@ -12,13 +13,15 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { dshPath } from '../lib/paths.mjs'
+
 
 const argv = process.argv.slice(2)
 const bvid = argv.find((a) => !a.startsWith('--'))
 if (!bvid) { console.error('用法: node subtitles.mjs <BV> [--lan ai-zh] [--out 目录] [--print 12]'); process.exit(2) }
 const opt = {}
 for (let i = 0; i < argv.length; i += 1) {
-  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i]
+  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i] ?? true
 }
 const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 
@@ -26,7 +29,10 @@ const cred = JSON.parse(fs.readFileSync(path.join((process.env.USERPROFILE || pr
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const cookie = `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3}`
 const H = { 'user-agent': UA, referer: `https://www.bilibili.com/video/${bvid}/`, cookie }
-const jget = async (u) => (await fetch(u, { headers: H })).json()
+// ⚠️ 不能直接 `.json()`：B 站有些端点（尤其没字幕时的兜底 /x/v2/subtitle/web/view）会回 HTML，
+//    一旦 parse 失败就抛 SyntaxError，整个命令崩掉 —— 明明只是"这条视频没有字幕"。
+//    这里统一兜成 JSON：非 JSON 就返回 { code: -1, message: 'non-JSON …' }，让下游按"没有"处理。
+const jget = u => apiGet(u, H)
 
 // WBI 签名（各脚本里重复了一份，保持一致；要改就一起改）
 const MIXIN_TAB = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
@@ -84,7 +90,7 @@ try { body = JSON.parse(rawText).body ?? [] } catch { console.error('字幕不�
 if (!body.length) { console.error('字幕 JSON 里 body 是空的'); process.exit(5) }
 console.log(`字幕行数: ${body.length}   覆盖 ${fmt(body[0].from)} → ${fmt(body.at(-1).to ?? body.at(-1).from)}`)
 
-const outDir = typeof opt.out === 'string' ? opt.out : path.join((process.env.USERPROFILE || process.env.HOME || '/'), '.dsh', 'shots', 'subs')
+const outDir = typeof opt.out === 'string' ? opt.out : dshPath('shots', 'subs')
 fs.mkdirSync(outDir, { recursive: true })
 const base = path.join(outDir, `${bvid}-${pick.lan}`)
 fs.writeFileSync(base + '.json', rawText)

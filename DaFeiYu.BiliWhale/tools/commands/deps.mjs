@@ -8,6 +8,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { ffmpegInfo } from '../lib/ffmpeg.mjs'
+import { apiState } from '../lib/bili-api.mjs'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || '.'
 const cred = path.join(HOME, '.bili-ai', 'credentials.json')
@@ -66,7 +67,35 @@ try {
   fs.writeFileSync(probe, 'ok'); fs.unlinkSync(probe)
   dirOk = true
 } catch {}
+// 2026-10-21 加（Issue #8-3）：没有 node 运行时 → 生物钟/监听/直播间全部停用，
+//   但以前体检不报这一项 ✗ 表面全绿、其实永远不会醒 ✗
+try {
+  const { NODE_EXE, isRealNode } = await import('../lib/nodebin.mjs')
+  const real = isRealNode()
+  items.push({
+    name: 'node 运行时',
+    ok: real,
+    detail: real ? NODE_EXE : ('这个不是 node：' + NODE_EXE + '（会静默返回空输出）'),
+    fix: '设置环境变量 DSH_NODE 指向 node 可执行文件的绝对路径，然后重启 DSH',
+  })
+} catch (e) {
+  items.push({ name: 'node 运行时', ok: false, detail: '检查失败：' + String(e?.message ?? e).slice(0, 80), fix: '设置 DSH_NODE' })
+}
+
 items.push({ name: '数据目录可写', ok: dirOk, detail: path.join(HOME, '.bili-ai'), fix: '检查该目录权限' })
+// 2026-10-22：把「接口缓存 / 熔断」现状也列出来 ——
+//   被 412 限流时最想知道的就是「还要等多久」和「缓存里还有多少能撑」
+try {
+  const st = apiState()
+  items.push({
+    name: 'B站 限流',
+    ok: !st.banned,
+    detail: st.banned
+      ? `熔断中，约 ${st.banMinutesLeft} 分钟后恢复（原因 ${st.banWhy ?? '-'}）；缓存里 ${st.cacheEntries} 条可撑`
+      : `正常 · 元信息缓存 ${st.cacheEntries} 条`,
+    fix: '等它自己恢复（5→10→20→30 分钟退避）；期间只读缓存，别手动狂点',
+  })
+} catch {}
 
 const bad = items.filter((i) => !i.ok)
 

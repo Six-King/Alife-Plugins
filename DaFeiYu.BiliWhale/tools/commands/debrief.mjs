@@ -1,3 +1,4 @@
+import { apiGet } from '../lib/bili-api.mjs'
 // 「看懂视频」一条龙：封面 + 简介 + 官方字幕 + 弹幕热区 + 热评 + 画面抽帧，六路齐出。
 //
 // 用法: node debrief.mjs <BV> [--bucket 30] [--top 5] [--grid 3x3] [--no-frames] [--substrip 每N秒] [--comments 8]
@@ -15,16 +16,19 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import zlib from 'node:zlib'
-import { execFileSync } from 'node:child_process'
+import { execFileSync } from '../lib/capture.mjs'
 import { fileURLToPath } from 'node:url'
 import { config } from '../lib/config.mjs'
+import { dshPath } from '../lib/paths.mjs'
+import { NODE_EXE } from '../lib/nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
+
 
 const argv = process.argv.slice(2)
 const bvid = argv.find((a) => !a.startsWith('--'))
 if (!bvid) { console.error('用法: node debrief.mjs <BV> [--bucket 30] [--top 5] [--grid 3x3] [--no-frames]'); process.exit(2) }
 const opt = {}
 for (let i = 0; i < argv.length; i += 1) {
-  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i]
+  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i] ?? true
 }
 const BUCKET = Number(opt.bucket ?? 30)
 const TOP = Number(opt.top ?? 5)
@@ -56,7 +60,7 @@ const cred = JSON.parse(fs.readFileSync(path.join((process.env.USERPROFILE || pr
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const cookie = `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3}`
 const H = { 'user-agent': UA, referer: `https://www.bilibili.com/video/${bvid}/`, cookie }
-const jget = async (u) => (await fetch(u, { headers: H })).json()
+const jget = u => apiGet(u, H)
 
 // WBI（与其它脚本一致）
 const MIXIN_TAB = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
@@ -69,7 +73,7 @@ const wbi = (params) => {
     .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(String(k === 'wts' ? wts : params[k]).replace(/[!'()*]/g, ''))}`).join('&')
   return `${q}&w_rid=${crypto.createHash('md5').update(q + mixin).digest('hex')}`
 }
-const shots = path.join((process.env.USERPROFILE || process.env.HOME || '/'), '.dsh', 'shots')
+const shots = dshPath('shots')
 fs.mkdirSync(path.join(shots, 'covers'), { recursive: true })
 fs.mkdirSync(path.join(shots, 'subs'), { recursive: true })
 
@@ -209,7 +213,11 @@ if (!opt['no-frames']) {
   try {
     // ⚠️ 必须用 fileURLToPath：用 URL.pathname 会把路径里的空格变成 %20（实测踩过）
     const watch = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bili-watch.mjs')
-    const out = execFileSync(process.execPath, [watch, bvid, GRID], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    // 2026-10-22 修（主人实测撞上）：25 分钟的片子抽帧 ETIMEDOUT ✗
+    //   capture 的默认超时是 120s，而「场景检测空跑 + 下载 + 抽帧」按时长线性长 ✗
+    //   改成按时长算：120s + 每秒视频 1.5s（25 分钟 → 约 40 分钟余量 ✓）
+    const framesTimeout = 120_000 + Math.round((Number(dur ?? 0) || 0) * 1.5) * 1000
+    const out = execFileSync(NODE_EXE, [watch, bvid, GRID], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: framesTimeout })
     for (const line of out.split('\n')) if (/^(SHEET|SUBS|实际画质|取帧方式)/.test(line)) console.log(line)
     sheet = (out.split('\n').find((l) => l.startsWith('SHEET:')) || '').slice(6).trim() || null
   } catch (e) { console.log(`（抽帧失败：${String(e.message).slice(0, 200)}）`) }

@@ -19,6 +19,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { NODE_EXE } from '../lib/nodebin.mjs'   // 2026-10-21：别用 process.execPath（Electron 里它是主程序 ✗）
 
 const HOME = process.env.USERPROFILE || process.env.HOME || '.'
 const FILE = path.join(HOME, '.bili-ai', 'pending-replies.json')
@@ -73,7 +74,7 @@ if (cmd === 'add') {
       '回我「发」就发 ✓ 回「不发」就撤掉 ✓（也可以直接给我改一版）',
     ].filter(Boolean).join('\n')
     const notifier = path.join(path.dirname(fileURLToPath(import.meta.url)), 'notify.mjs')
-    execFile(process.execPath, [notifier, summary, '--title', '待审回复'],
+    execFile(NODE_EXE, [notifier, summary, '--title', '待审回复'],
       { windowsHide: true, timeout: 60000 }, () => {})
   } catch {}
   process.exit(0)

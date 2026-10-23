@@ -15,6 +15,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { config } from '../lib/config.mjs'
+import { dshPath } from '../lib/paths.mjs'
+
 
 const argv = process.argv.slice(2)
 // 设置页的「日记总开关」真的生效（2026-10-18 修）：关掉就什么都不记
@@ -22,14 +24,13 @@ if (config().diary?.enabled === false) { console.log('（日记总开关关着 �
 const cmd = argv[0]
 const opt = {}
 for (let i = 1; i < argv.length; i += 1) {
-  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i]
+  if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i] ?? true
   else if (!opt._a) opt._a = argv[i]
 }
 const HOME = (process.env.USERPROFILE || process.env.HOME || '/')
-// 日记已改成纯文本 txt（2026-10-20）：插件用 WHALE_DIARY_FILE 指过来，没设才回退到老的 .md 路径
-const DIARY = process.env.WHALE_DIARY_FILE || path.join(HOME, '.dsh', 'whale-diary.md')
+const DIARY = process.env.WHALE_DIARY_FILE || dshPath('whale-diary.md')
 const QUOTA = path.join(HOME, '.bili-ai', 'quota.json')
-const LOG = path.join(HOME, '.dsh', 'whale-log.jsonl')
+const LOG = dshPath('whale-log.jsonl')
 const today = () => new Date().toLocaleDateString('sv-SE')
 const hhmm = (iso) => String(iso).slice(11, 16)
 
@@ -44,7 +45,7 @@ if (cmd === 'log') {
 if (cmd === 'tail') {
   const n = Number(opt.n ?? 20)
   let lines = []
-  try { lines = fs.readFileSync(LOG, 'utf8').trim().split('\n').filter(Boolean) } catch {}
+  try { lines = fs.readFileSync(LOG, 'utf8').trim().split(/\r?\n/).filter(Boolean) } catch {}
   if (!lines.length) { console.log('（还没有事件记录）'); process.exit(0) }
   for (const l of lines.slice(-n)) {
     try { const e = JSON.parse(l); console.log(`  ${String(e.at).slice(0, 16).replace('T', ' ')}  ${e.kind}  ${e.target ?? ''}  ${e.note ?? ''}`) }
@@ -65,7 +66,7 @@ if (cmd === 'show' || !cmd) {
   if (text) {
     const sections = {}
     let cur = null
-    for (const line of text.split('\n')) {
+    for (const line of text.split(/\r?\n/)) {
       const h = line.match(/^##\s+(.+)$/)
       if (h) { cur = h[1].trim(); sections[cur] = []; continue }
       if (cur) sections[cur].push(line)
@@ -91,17 +92,24 @@ if (cmd === 'show' || !cmd) {
   console.log('\n【对外发言（今天）】')
   try {
     const q = JSON.parse(fs.readFileSync(QUOTA, 'utf8'))
-    const todayLog = (q.log ?? []).filter((x) => String(x.at).startsWith(today()))
+    // 2026-10-21 修（外部审计 #8）：账本里的 at 是 UTC ISO 串，直接 startsWith(本地日期)
+    //   会把凌晨 0–8 点的发言算到"昨天"✗（quota.mjs 早就修过同一个坑，这里漏了）
+    //   统一先把时间戳转成本地日期再比 ✓
+    const dayOf = (at) => new Date(at).toLocaleDateString('sv-SE')
+    const todayLog = (q.log ?? []).filter((x) => dayOf(x.at) === today())
     const auto = todayLog.filter((x) => x.auto).length
-    console.log(`  共 ${todayLog.length} 条（自主 ${auto}/${q.daily}，主人授权 ${todayLog.length - auto}）`)
-    for (const x of todayLog) console.log(`  · ${hhmm(x.at)}  ${x.type}${x.auto ? '（自主）' : ''}  ${x.target ?? ''}  ${x.note ?? ''}`)
+    // q.daily 早就不写盘了（save() 只持久化 {log}）→ 显示 undefined 会误导 ✗
+    const dailyCap = Number(q.daily ?? q.shareDaily ?? 0)
+    console.log(`  共 ${todayLog.length} 条（自主 ${auto}${dailyCap ? '/' + dailyCap : ''}，主人授权 ${todayLog.length - auto}）` + (dailyCap ? '' : ' · 自主发言不设条数上限 ✓'))
+    for (const x of todayLog) console.log(`  · ${hhmm(x.at)}  ${x.type}${x.auto ? '（自主）' : ''}  ${x.target ?? ''}  ${String(x.note ?? '').slice(0, 24)}${String(x.note ?? '').length > 24 ? '…' : ''}`)
+    if (todayLog.length) console.log('    （以上旧文案只用于查账，别照抄它的句式或开场白；每次换新说法）')
     if (!todayLog.length) console.log('  （今天一条都没发）✓')
   } catch { console.log('  （还没有发言记录 —— 发第一条时 `quota record` 会自动建 quota.json）✓') }
 
   // ③ 事件流
   console.log('\n【最近事件】')
   let lines = []
-  try { lines = fs.readFileSync(LOG, 'utf8').trim().split('\n').filter(Boolean) } catch {}
+  try { lines = fs.readFileSync(LOG, 'utf8').trim().split(/\r?\n/).filter(Boolean) } catch {}
   if (!lines.length) console.log('  （还没有事件记录 —— `diary log` 会往这里写）')
   for (const l of lines.slice(-6)) {
     try { const e = JSON.parse(l); console.log(`  · ${String(e.at).slice(5, 16).replace('T', ' ')}  ${e.kind}  ${e.target ?? ''}  ${e.note ?? ''}`) } catch {}

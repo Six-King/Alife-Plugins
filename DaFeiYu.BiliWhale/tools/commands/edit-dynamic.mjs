@@ -4,6 +4,9 @@
 //   不给 --go 就只打印将要发送的 payload（预演）。
 import fs from 'node:fs'
 import path from 'node:path'
+// 2026-10-21 修（外部审计）：下面 --go 路径里调了 gate()，但从来没导入过 ✗
+//   一跑到那儿就是 ReferenceError（danmaku.mjs 早就踩过同一个坑，这次补齐三条）
+import { gate } from '../lib/quota-gate.mjs'
 
 const dyn = process.argv[2]
 const textFile = process.argv[3]
